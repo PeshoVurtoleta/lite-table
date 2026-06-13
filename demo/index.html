@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>@zakkster/lite-table M1 demo</title>
+<style>
+    :root {
+        color-scheme: dark;
+        --bg: #0b1220;
+        --panel: #131c2f;
+        --panel-2: #172033;
+        --border: #1f2937;
+        --border-2: #334155;
+        --text: #e2e8f0;
+        --muted: #94a3b8;
+        --accent: #60a5fa;
+        --accent-2: #3b82f6;
+
+        /* Spacing scale -- in rem so the whole layout scales with the user's
+           browser font-size setting. */
+        --gap-xs: 0.25rem;   /*  4px @ 16px root */
+        --gap-sm: 0.375rem;  /*  6px */
+        --gap-md: 0.75rem;   /* 12px */
+        --gap-lg: 1rem;      /* 16px */
+
+        /* Layout sizes that need to track real device viewport (dvh/dvw
+           account for mobile browser chrome that vh ignores). */
+        --sidebar-w: 17.5rem;  /* 280px @ 16px root */
+        --radius: 0.375rem;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+        height: 100dvh;          /* dvh, not vh -- mobile-safe */
+        overflow: hidden;
+    }
+    body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: system-ui, sans-serif;
+        font-size: 0.875rem;     /* ~14px */
+        display: grid;
+        grid-template-columns: var(--sidebar-w) 1fr;
+        grid-template-rows: auto 1fr auto;
+        gap: var(--gap-md);
+        padding: var(--gap-md);
+    }
+    header {
+        grid-column: 1 / -1;
+        display: flex;
+        align-items: baseline;
+        gap: var(--gap-md);
+        padding: 0 var(--gap-xs);
+        flex-wrap: wrap;
+    }
+    h1 {
+        font-size: 1.125rem;
+        margin: 0;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+    }
+    .sub {
+        color: var(--muted);
+        font-size: 0.75rem;
+    }
+    aside {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: var(--gap-md);
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 0.875rem;
+        min-height: 0;
+    }
+    aside h2 {
+        font-size: 0.6875rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        margin: 0 0 var(--gap-sm);
+        font-weight: 600;
+    }
+    .panel-group {
+        display: flex;
+        flex-direction: column;
+        gap: var(--gap-sm);
+    }
+    .row {
+        display: flex;
+        gap: var(--gap-sm);
+        flex-wrap: wrap;
+        align-items: center;
+    }
+    button, .btn {
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid var(--border-2);
+        border-radius: var(--radius);
+        padding: 0.3125rem 0.625rem;
+        font-size: 0.75rem;
+        cursor: pointer;
+        font-family: inherit;
+        line-height: 1.4;
+        touch-action: manipulation;
+    }
+    button:hover { background: #1e293b; border-color: #475569; }
+    button:active { background: #0f172a; }
+    button.is-active { border-color: var(--accent); color: var(--accent); }
+    input[type="number"], input[type="text"], select {
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid var(--border-2);
+        border-radius: var(--radius);
+        padding: 0.3125rem 0.5rem;
+        font-size: 0.75rem;
+        font-family: inherit;
+        width: 100%;
+    }
+    input[type="number"] { width: 5.625rem; }
+    label {
+        display: flex;
+        align-items: center;
+        gap: var(--gap-sm);
+        font-size: 0.75rem;
+        cursor: pointer;
+        padding: 0.1875rem 0;
+    }
+    input[type="checkbox"] { accent-color: var(--accent); width: 1rem; height: 1rem; }
+    .col-row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: var(--gap-xs);
+        align-items: center;
+        padding: var(--gap-sm) 0;
+        border-bottom: 1px solid var(--border);
+    }
+    .col-row:last-child { border-bottom: 0; }
+    .col-row .name-line {
+        display: flex;
+        align-items: center;
+        gap: var(--gap-sm);
+    }
+    .col-row .pin-line {
+        display: flex;
+        align-items: center;
+        gap: 0.125rem;
+    }
+    .col-row .pin-line-label {
+        font-size: 0.625rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        margin-right: var(--gap-sm);
+    }
+    .col-name { font-weight: 500; }
+    .pin-btn {
+        padding: 0.125rem 0.5rem;
+        font-size: 0.6875rem;
+        min-width: 1.75rem;
+        font-family: ui-monospace, monospace;
+    }
+    main {
+        grid-column: 2;
+        grid-row: 2;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        overflow: hidden;
+        min-height: 0;
+        min-width: 0;         /* allow grid item to shrink for h-scroll */
+    }
+    footer {
+        grid-column: 1 / -1;
+        display: flex;
+        gap: var(--gap-lg);
+        align-items: center;
+        flex-wrap: wrap;
+        font-size: 0.75rem;
+        color: var(--muted);
+        padding: var(--gap-sm) var(--gap-md);
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+    }
+    footer .stat { font-variant-numeric: tabular-nums; }
+    footer .stat b { color: var(--accent); font-weight: 600; }
+
+    .kbd-help { font-size: 0.6875rem; line-height: 1.6; color: var(--muted); }
+    .kbd-help kbd {
+        background: var(--panel-2);
+        border: 1px solid var(--border-2);
+        border-radius: 3px;
+        padding: 1px 5px;
+        font-family: ui-monospace, monospace;
+        font-size: 0.625rem;
+        color: var(--text);
+    }
+
+    /* Drawer toggle button -- hidden on desktop, shown on mobile. */
+    .drawer-toggle {
+        display: none;
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid var(--border-2);
+        border-radius: var(--radius);
+        padding: 0.375rem 0.625rem;
+        font-size: 1rem;
+        line-height: 1;
+        cursor: pointer;
+    }
+    .drawer-toggle:hover { background: #1e293b; }
+    .backdrop { display: none; }
+
+    /* ------ Mobile / narrow layout ----------------------------------------
+       Sidebar becomes a slide-out drawer triggered by the hamburger button.
+       Default state: drawer closed, main fills the screen. */
+    @media (max-width: 50rem) {
+        body {
+            grid-template-columns: 1fr;
+            grid-template-rows: auto 1fr auto;
+        }
+        h1 { font-size: 1rem; }
+        .drawer-toggle { display: inline-flex; align-items: center; }
+
+        aside {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 100dvh;
+            width: min(85vw, 22rem);
+            max-height: none;
+            margin: 0;
+            border-radius: 0;
+            border-right: 1px solid var(--border);
+            z-index: 20;
+            transform: translateX(-101%);
+            transition: transform 0.18s ease-out;
+        }
+        body.drawer-open aside { transform: translateX(0); }
+
+        .backdrop {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.45);
+            z-index: 15;
+        }
+        body.drawer-open .backdrop { display: block; }
+    }
+
+    /* Larger touch targets on coarse pointers (touch screens, styluses). */
+    @media (pointer: coarse) {
+        button, .btn { padding: 0.5rem 0.875rem; font-size: 0.875rem; }
+        .pin-btn { min-width: 2rem; padding: 0.25rem 0.5rem; }
+    }
+
+    /* ------ Theme overrides for the grid against the dark page ------------- */
+    .lt-root {
+        background: var(--panel) !important;
+        border-color: var(--border) !important;
+        color: var(--text) !important;
+        --lt-pin-bg: var(--panel);
+        --lt-pin-alt-bg: var(--panel-2);
+    }
+    .lt-header { background: var(--bg) !important; border-color: var(--border) !important; }
+    .lt-header-cell { color: #cbd5e1 !important; border-color: var(--border) !important; background: var(--bg) !important; }
+    .lt-header-cell.is-sortable:hover { background: #0f172a !important; }
+    .lt-header-cell[data-pin="left"], .lt-header-cell[data-pin="right"] { background: var(--bg) !important; }
+    .lt-row { border-color: var(--border) !important; background: var(--panel) !important; }
+    .lt-row.lt-row-alt { background: var(--panel-2) !important; }
+    .lt-row.is-selected { background: #1e3a8a !important; }
+    .lt-row.is-selected.lt-row-alt { background: #1e40af !important; }
+    .lt-cell { border-color: var(--border) !important; }
+    .lt-cell.is-focused { outline: 2px solid var(--accent) !important; outline-offset: -2px !important; }
+    .lt-header-resize { width: 0.5rem !important; }
+    .lt-header-resize:hover, .lt-header-resize.is-active { background: var(--accent-2) !important; }
+    .lt-header-cell.is-drop-before { box-shadow: 2px 0 0 var(--accent) inset !important; }
+    .lt-header-cell.is-drop-after { box-shadow: -2px 0 0 var(--accent) inset !important; }
+
+    /* Bigger resize handle on touch. */
+    @media (pointer: coarse) {
+        .lt-header-resize { width: 0.875rem !important; }
+    }
+</style>
+</head>
+<body>
+
+<header>
+    <button class="drawer-toggle" id="drawer-toggle" aria-label="Open controls" aria-controls="sidebar">&#9776;</button>
+    <h1>@zakkster/lite-table</h1>
+    <span class="sub">M1 preview &middot; <b id="stat-header-rows">0</b> rows &middot; sort &middot; resize &middot; reorder &middot; pin &middot; hide &middot; selection &middot; keyboard</span>
+</header>
+
+<div class="backdrop" id="backdrop" aria-hidden="true"></div>
+
+<aside id="sidebar">
+    <div class="panel-group">
+        <h2>Scroll</h2>
+        <div class="row">
+            <button id="btn-top">Top</button>
+            <button id="btn-mid">Row 50,000</button>
+            <button id="btn-end">End</button>
+        </div>
+        <div class="row">
+            <input id="goto" type="number" min="0" max="99999" placeholder="row #">
+            <button id="btn-goto">Go</button>
+        </div>
+    </div>
+
+    <div class="panel-group">
+        <h2>Data</h2>
+        <div class="row">
+            <button id="btn-mutate">Mutate row 42</button>
+            <button id="btn-filter">Filter: even ids</button>
+        </div>
+        <div class="row">
+            <button id="btn-add-1k">Append 1k rows</button>
+            <button id="btn-reset">Reset dataset</button>
+        </div>
+    </div>
+
+    <div class="panel-group">
+        <h2>Sort</h2>
+        <div class="row">
+            <button id="btn-clear-sort">Clear sort</button>
+            <span class="sub" id="stat-sort">none</span>
+        </div>
+        <div class="kbd-help">
+            Click a header to sort. <kbd>Shift</kbd>+click to chain.
+        </div>
+    </div>
+
+    <div class="panel-group">
+        <h2>Columns</h2>
+        <div id="col-controls"></div>
+        <div class="kbd-help">
+            Checkbox shows/hides column. <kbd>L</kbd> / <kbd>R</kbd> sticks the
+            column to the left / right edge during horizontal scroll.<br>
+            To reorder: drag a column header in the grid.
+            To resize: drag the right edge of a header.
+        </div>
+    </div>
+
+    <div class="panel-group">
+        <h2>Selection</h2>
+        <div class="row">
+            <button id="btn-select-all">Select all</button>
+            <button id="btn-clear-sel">Clear</button>
+        </div>
+        <div class="sub" id="stat-sel">0 selected</div>
+    </div>
+
+    <div class="panel-group">
+        <h2>Keyboard (focus the grid first)</h2>
+        <div class="kbd-help">
+            <kbd>&uarr;</kbd> <kbd>&darr;</kbd> <kbd>&larr;</kbd> <kbd>&rarr;</kbd> move focus<br>
+            <kbd>Home</kbd> / <kbd>End</kbd> row start / end<br>
+            <kbd>Ctrl</kbd>/<kbd>&#8984;</kbd>+<kbd>Home</kbd>/<kbd>End</kbd> grid corners<br>
+            <kbd>PgUp</kbd> / <kbd>PgDn</kbd> page jump<br>
+            <kbd>Space</kbd> toggle selection<br>
+            <kbd>Ctrl</kbd>/<kbd>&#8984;</kbd>+<kbd>A</kbd> select all<br>
+            <kbd>Esc</kbd> clear selection<br>
+            <kbd>Shift</kbd>+click row, <kbd>Ctrl</kbd>/<kbd>&#8984;</kbd>+click toggle
+        </div>
+    </div>
+</aside>
+
+<main id="host"></main>
+
+<footer>
+    <span class="stat">Rows: <b id="stat-rows">0</b></span>
+    <span class="stat">Pool: <b id="stat-pool">0</b></span>
+    <span class="stat">Visible: <b id="stat-vis-start">0</b>&ndash;<b id="stat-vis-end">0</b></span>
+    <span class="stat">Focus: <b id="stat-focus">none</b></span>
+    <span class="stat">Selected: <b id="stat-selcount">0</b></span>
+</footer>
+
+<script type="importmap">
+{
+  "imports": {
+    "@zakkster/lite-signal":     "../node_modules/@zakkster/lite-signal/Signal.js",
+    "@zakkster/lite-virtual":    "../node_modules/@zakkster/lite-virtual/Virtual.js",
+    "@zakkster/lite-signal-dom": "../node_modules/@zakkster/lite-signal-dom/SignalDom.js",
+    "@zakkster/lite-table":      "../Table.js"
+  }
+}
+</script>
+
+<script type="module">
+    import { signal, effect, createRegistry, setDefaultRegistry } from "@zakkster/lite-signal";
+    import { createTable, mountTable } from "@zakkster/lite-table";
+
+    // The demo + table together can briefly peak past the default 1024-node
+    // cap during mobile-preview resize storms (ResizeObserver fires N times,
+    // pool grows, each new slot adds ~30 reactive nodes for its cells).
+    // Production apps should keep the default cap to catch leaks; for a demo
+    // that intentionally stresses growth, "grow" is the right policy.
+    setDefaultRegistry(createRegistry({
+        onCapacityExceeded: "grow",
+        initialNodes: 4096
+    }));
+
+    // ---- Data ----
+    const STATUSES = ["active", "pending", "archived", "blocked"];
+    const N0 = 100_000;
+    function makeRow(i) {
+        return {
+            id: i,
+            name: "Row " + String(i).padStart(6, "0"),
+            email: "user" + i + "@example.com",
+            value: Math.round((Math.sin(i * 0.13) + 1) * 5000) / 10,
+            status: STATUSES[i % STATUSES.length],
+            createdAt: new Date(2024, 0, 1 + (i % 365)).toISOString().slice(0, 10)
+        };
+    }
+    const baseData = Array.from({ length: N0 }, (_, i) => makeRow(i));
+    const rows = signal(baseData);
+
+    // ---- Table ----
+    // `flex: 1` on Name and Email lets those columns absorb the leftover
+    // horizontal space on wide viewports. The fixed-width columns (ID,
+    // Value, Status, Created) stay at their declared sizes. This matches
+    // typical data-grid expectations: identity / status columns are exact,
+    // free-form text columns grow to fill.
+    const COLS = [
+        { key: "id",        header: "ID",      width: 90,  minWidth: 60 },
+        { key: "name",      header: "Name",    width: 180, minWidth: 120, flex: 1 },
+        { key: "email",     header: "Email",   width: 240, minWidth: 180, flex: 2 },
+        { key: "value",     header: "Value",   width: 100, compare: (a, b) => a - b },
+        { key: "status",    header: "Status",  width: 110 },
+        { key: "createdAt", header: "Created", width: 130 }
+    ];
+
+    const table = createTable({
+        rows, columns: COLS, getRowId: (r) => r.id,
+        rowHeight: 32, overscan: 4
+    });
+
+    const mount = mountTable(document.getElementById("host"), table);
+
+    // ---- Live stats ----
+    const $ = (id) => document.getElementById(id);
+    $("stat-pool").textContent = mount.poolSize();
+    effect(() => { $("stat-vis-start").textContent = mount.axis.start(); });
+    effect(() => { $("stat-vis-end").textContent = mount.axis.end(); });
+    effect(() => {
+        const n = table.rowCount().toLocaleString();
+        $("stat-rows").textContent = n;
+        $("stat-header-rows").textContent = n;
+    });
+    effect(() => {
+        const f = table.focusedCell();
+        $("stat-focus").textContent = f ? "row " + f.rowId + " / " + f.columnKey : "none";
+    });
+    effect(() => {
+        const n = table.selectedCount();
+        $("stat-selcount").textContent = n;
+        $("stat-sel").textContent = n + " selected";
+    });
+    effect(() => {
+        const chain = table.sortChain();
+        $("stat-sort").textContent = chain.length === 0
+            ? "none"
+            : chain.map((e) => e.key + " " + e.dir).join(", ");
+    });
+
+    // ---- Scroll buttons ----
+    $("btn-top").onclick = () => mount.scrollToIndex(0);
+    $("btn-mid").onclick = () => mount.scrollToIndex(50_000, "center");
+    $("btn-end").onclick = () => mount.scrollToIndex(table.rowCount.peek() - 1, "end");
+    $("btn-goto").onclick = () => {
+        const n = parseInt($("goto").value, 10);
+        if (Number.isFinite(n)) mount.scrollToIndex(n, "center");
+    };
+
+    // ---- Data ops ----
+    $("btn-mutate").onclick = () => {
+        const arr = rows.peek().slice();
+        arr[42] = { ...arr[42], name: "MUTATED @ " + new Date().toLocaleTimeString(), value: 999.9 };
+        rows.set(arr);
+        mount.scrollToIndex(42, "center");
+        table.focusedCell.set({ rowId: 42, columnKey: "name" });
+    };
+    $("btn-filter").onclick = () => {
+        rows.set(baseData.filter((r) => r.id % 2 === 0));
+    };
+    $("btn-add-1k").onclick = () => {
+        const arr = rows.peek().slice();
+        const startId = arr.length;
+        for (let i = 0; i < 1000; i++) arr.push(makeRow(startId + i));
+        rows.set(arr);
+    };
+    $("btn-reset").onclick = () => {
+        rows.set(baseData);
+        table.clearSelection();
+        table.clearSort();
+        for (const c of table.columns) {
+            c.hidden.set(false);
+            c.pin.set("none");
+        }
+    };
+
+    // ---- Sort ----
+    $("btn-clear-sort").onclick = () => table.clearSort();
+
+    // ---- Selection ----
+    $("btn-select-all").onclick = () => table.selectAll();
+    $("btn-clear-sel").onclick = () => table.clearSelection();
+
+    // ---- Column controls (hide / pin) ----
+    const colControls = $("col-controls");
+    for (const col of table.columns) {
+        const row = document.createElement("div");
+        row.className = "col-row";
+
+        // Top line: visibility checkbox + column name.
+        const nameLine = document.createElement("label");
+        nameLine.className = "name-line";
+
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = !col.hidden.peek();
+        cb.title = "Show/hide " + col.header;
+        cb.onchange = () => col.hidden.set(!cb.checked);
+        effect(() => { cb.checked = !col.hidden(); });
+
+        const label = document.createElement("span");
+        label.className = "col-name";
+        label.textContent = col.header;
+        nameLine.append(cb, label);
+
+        // Bottom line: explicit "Pin:" label + three clear buttons.
+        const pinLine = document.createElement("div");
+        pinLine.className = "pin-line";
+        const pinLabel = document.createElement("span");
+        pinLabel.className = "pin-line-label";
+        pinLabel.textContent = "Pin";
+        pinLine.appendChild(pinLabel);
+
+        const makePinBtn = (side, text, ariaLabel) => {
+            const btn = document.createElement("button");
+            btn.className = "pin-btn";
+            btn.textContent = text;
+            btn.setAttribute("aria-label", ariaLabel);
+            btn.title = ariaLabel;
+            btn.onclick = () => col.pin.set(side);
+            effect(() => {
+                if (col.pin() === side) btn.classList.add("is-active");
+                else btn.classList.remove("is-active");
+            });
+            return btn;
+        };
+
+        pinLine.append(
+            makePinBtn("left",  "L",   "Pin " + col.header + " to left edge"),
+            makePinBtn("none",  "off", "Unpin " + col.header),
+            makePinBtn("right", "R",   "Pin " + col.header + " to right edge")
+        );
+
+        row.append(nameLine, pinLine);
+        colControls.appendChild(row);
+    }
+
+    // ---- Mobile drawer ----
+    const drawerToggle = $("drawer-toggle");
+    const backdrop = $("backdrop");
+    const closeDrawer = () => document.body.classList.remove("drawer-open");
+    drawerToggle.onclick = () => document.body.classList.toggle("drawer-open");
+    backdrop.onclick = closeDrawer;
+    // Esc closes drawer (also clears selection when grid focused, that's fine).
+    document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && document.body.classList.contains("drawer-open")) {
+            closeDrawer();
+        }
+    });
+
+    // Focus the grid on load so keyboard works.
+    mount.root.focus();
+</script>
+</body>
+</html>
