@@ -1,0 +1,262 @@
+# @zakkster/lite-table
+
+Headless reactive data tables. CSS Grid. Zero-GC scrolling. Built on
+@zakkster/lite-signal, @zakkster/lite-virtual, @zakkster/lite-signal-dom.
+
+## Architecture invariants
+
+- No <table>. CSS Grid layout. role=grid / row / columnheader / gridcell.
+- Position-keyed slot pool. DOM topology never changes after mount.
+  Scroll, sort, filter, hide, reorder, pin -- all mutate bindings, not DOM.
+- Object.is cutoff on truncated row indices: sub-row scrolls are 0 writes.
+- Logical focus is a signal (focusedCell). DOM focus stays on the root
+  container, which has tabindex=0 and aria-activedescendant.
+- Focus indicator is a class (.is-focused) applied via bindClass per cell.
+  Cheaper than a dynamic <style> rewrite because it doesn't invalidate
+  CSSOM globally; per focus move, only the 1-2 cells whose match state
+  flipped actually write classList.
+- Pin uses one CSS Grid with position:sticky on individual cells, NOT
+  three split grids. Sticky offsets are cumulative-width computeds.
+- pointerdown for input, not mousedown. isPrimary guard. No preventDefault
+  on cell pointerdown (preserves text selection on mouse, scroll on touch).
+- Cell pointerdown is delegated to the root container -- ONE listener
+  handles all cells via closest('.lt-cell') + data-key + slot-index lookup.
+  Avoids attaching N x M listeners per mount.
+- Sort uses a reusable Uint32Array of indices. One fill (0..N-1), one
+  in-place sort with a comparator dereferencing rows, one output array.
+  Zero per-row tuple allocations.
+- Reactive columns: each ColumnState has width/hidden/pin signals.
+  columnOrder is a Signal<string[]>. visibleColumns is a computed that
+  filters hidden + buckets by pin in [left, none, right] order.
+- visibleRows is a computed that applies sortChain (stable multi-key sort).
+- Selection is Signal<Set<rowId>>. Range uses an anchor and current
+  visibleRows ordering. is-selected class + aria-selected applied per row
+  via bindClass/bindAttr against the slot's projected row id.
+- Scope tracks all signals, computeds, effects, listeners, bindings.
+  dispose() is symmetric with construct: every node tracked, every node
+  released.
+
+## Public surface
+
+### createTable(config) -> TableCore
+
+config: {
+  rows: Row[] | () => Row[],
+  columns: ColumnDef[],
+  getRowId: (row) => string|number,    // REQUIRED
+  rowHeight?: number = 32,
+  overscan?: number = 4,
+  initialFocus?: {rowId, columnKey} | null,
+  initialSort?: SortEntry[]
+}
+
+ColumnDef: {
+  key, header?, width?=120, minWidth?=40, maxWidth?=1600,
+  hidden?=false, pin?="none", flex?=0,
+  sortable?=true, resizable?=true, pinnable?=true,
+  hideable?=true, reorderable?=true,
+  accessor?: (row) => any,              // default row[key]
+  compare?: (a, b) => number            // default null-safe num/string
+}
+
+flex=0 (default): column is exactly width()px. Trailing 1fr fills empty.
+flex>0:           column renders as minmax(minWidth, flex+"fr") and shares
+                  leftover horizontal space proportionally with other flex
+                  columns. When ANY column has flex>0 the trailing 1fr is
+                  dropped (flex columns absorb the space themselves).
+
+TableCore reactive state:
+  columns                 readonly ColumnState[]
+  rowsGetter()            -> readonly Row[]
+  visibleRows             Computed<Row[]>       (sort applied)
+  rowCount                Computed<number>
+  columnOrder             Signal<string[]>
+  visibleColumns          Computed<ColumnState[]>
+  displayIndexByKey       Computed<Map<key, number>>
+  colTemplate             Computed<string>      (grid-template-columns)
+  leftOffsets             Computed<Map<key, number>>
+  rightOffsets            Computed<Map<key, number>>
+  sortChain               Signal<SortEntry[]>
+  focusedCell             Signal<{rowId, columnKey} | null>
+  selection               Signal<{mode, set}>   -- predicate, NOT a list
+  selectionAnchor         Signal<rowId | null>
+  selectedCount           Computed<number>      -- reactive O(1)
+
+selection.mode:
+  "whitelist"   set = the selected IDs (classic)
+  "all"         set = a BLACKLIST. Every row selected EXCEPT those in set.
+                Ctrl+A is O(1) -- no walk, no per-ID allocation.
+                Materialize via selectedIds() / selectedRows() /
+                forEachSelected() only when actually needed (submit,
+                copy, export). Range-select (shift-click) collapses
+                back to whitelist of the range.
+
+ColumnState fields:
+  Static: key, header, accessor, compare, sortable, resizable,
+          pinnable, hideable, reorderable, minWidth, maxWidth
+  Reactive: width: Signal<number>
+            hidden: Signal<boolean>
+            pin: Signal<"left"|"none"|"right">
+            flex: Signal<number>     // 0 = fixed, >0 = share leftover space
+
+TableCore methods (sort):
+  setSort(key, dir)                     replace chain
+  addSort(key, dir | null)              append / update / remove
+  toggleSort(key, {additive?})          cycle none -> asc -> desc -> none
+  clearSort()
+
+TableCore methods (selection):
+  selectRow(rowId, mode = "set")        mode: set | add | toggle | range
+  selectRowRange(anchorId, targetId)    collapses to whitelist of range
+  selectAll()                           O(1) flip to all-mode, empty blacklist
+  clearSelection()                      reset to whitelist-mode, empty set
+  isSelected(rowId) -> boolean          O(1) predicate (both modes)
+  selectedIds(source?) -> rowId[]       materialize; O(N) in source
+  selectedRows(source?) -> Row[]        same, returns row objects
+  forEachSelected(fn, source?)          streams; never materializes; return
+                                        false from fn to stop early
+
+TableCore methods (columns):
+  setColumnWidth(key, w)                clamps to min/max
+  setColumnHidden(key, hidden)
+  setColumnPin(key, side)               side: "left" | "none" | "right"
+  setColumnFlex(key, flex)              flex>0 = share space; 0 = fixed
+  setColumnOrder(keys[])                rejects non-permutations
+  moveColumn(fromKey, toKey, {before?}) splice one column
+
+TableCore methods (focus):
+  moveFocus(direction, {pageSize?})
+  directions: up, down, left, right, home, end,
+              rowStart, rowEnd, pageUp, pageDown
+  skips hidden columns; follows current sort order
+
+TableCore lifecycle:
+  dispose()                             releases all reactive nodes
+  cellId(rowId, columnKey)              -> "lt_<rowId>__<columnKey>"
+
+### mountTable(host, table, options?) -> TableMount
+
+options: { injectStyles?=true, initialViewportHeight?=480 }
+
+TableMount: {
+  root, viewport, axis,
+  scrollToIndex(index, align?),       // align: "start"|"center"|"end"
+  poolSize() -> number,
+  dispose()                           // tears down + removes from host
+}
+
+## DOM contract
+
+Root:    <div class="lt-root" role="grid" tabindex="0"
+              aria-multiselectable="true"
+              aria-rowcount aria-colcount aria-activedescendant?
+              style="--lt-cols: <colTemplate>">
+Header:  <div class="lt-header" role="row" aria-rowindex="1">
+           <div class="lt-header-cell [is-sortable] [is-dragging]
+                       [is-drop-before|is-drop-after]"
+                role="columnheader"
+                aria-colindex aria-sort="none|ascending|descending"
+                data-key data-pin="left|none|right"
+                style="grid-column; left|right (if pinned)">
+             <span class="lt-header-cell-label">...</span>
+             <span class="lt-header-sort">arrow or chain index+arrow</span>
+             <span class="lt-header-resize"></span>  <!-- if resizable -->
+           </div> ...
+         </div>
+Body:    <div class="lt-viewport"><div class="lt-inner">
+           <div class="lt-row [lt-row-alt] [is-selected]"
+                role="row"
+                aria-rowindex aria-selected
+                style="transform: translateY(<i*rowHeight>px)">
+             <div class="lt-cell" role="gridcell"
+                  id="lt_<rowId>__<columnKey>"
+                  aria-colindex
+                  data-pin
+                  style="grid-column; left|right (if pinned)">text</div>
+             ...
+           </div> ...
+         </div></div>
+
+## Keyboard
+
+ArrowUp/Down/Left/Right    move focus (skips hidden cols)
+Home/End                   row start/end (visible col 0 / last)
+Ctrl+Home/End              grid corners (0,0) / (last,last)
+PageUp/PageDown            +/- floor(viewportHeight / rowHeight)
+Space                      selectRow(focused.rowId, "set")
+Ctrl+A                     selectAll()
+Escape                     clearSelection()
+Click cell                 selectRow(set) + focus
+Shift+click                selectRow(range)
+Ctrl/Cmd+click             selectRow(toggle)
+Drag header                reorder
+Drag right edge of header  resize
+Click header               toggleSort
+Shift+click header         toggleSort additive
+
+## Performance
+
+Sub-row scroll          0 DOM writes
+Boundary cross          ~6 writes per moved slot
+Long scroll N rows      O(N) writes, not O(px)
+Pool size               bounded by viewport; monotonic with viewport grow
+Sort change             1 visibleRows recompute
+Focus move              O(1) -- 1 style rewrite + 1 attr write
+Column resize           O(1) per drag pixel
+Reorder                 O(visibleCells) gridColumn updates
+Hide                    O(visibleCells) display updates
+
+## Style hooks
+
+CSS variables on .lt-root:
+  --lt-cols                grid-template-columns (set reactively)
+  --lt-pin-bg              pinned cell background (default #fff)
+  --lt-pin-alt-bg          pinned cell alt-row background
+
+Classes for styling:
+  .lt-root :focus-visible  ring on root
+  .lt-row.lt-row-alt       odd rows
+  .lt-row.is-selected      selected row
+  .lt-header-cell.is-sortable
+  .lt-header-cell.is-dragging
+  .lt-header-cell.is-drop-before / .is-drop-after
+  .lt-header-resize:hover / .is-active
+
+## Files
+
+Table.js          single-file ESM source
+Table.d.ts        type declarations
+demo/index.html   QA demo with controls for all M1 features
+demo/serve.js     zero-dep static server (npm run demo)
+test/*.test.js    node:test suite (npm test, 110 tests across 9 files)
+bench/*.js        benchmarks vs clusterize.js + naive virtual (npm run bench)
+llms.txt          this file
+README.md         human docs with Mermaid diagrams + bench numbers
+
+## Empirical zero-GC verification
+
+Measured under Node 22 + happy-dom. Counters track DOM mutation API calls
+(appendChild, insertBefore, innerHTML, setAttribute, textContent, etc.)
+and split into:
+  allocations = appendChild + insertBefore + innerHTML  (GC pressure)
+  updates     = setAttribute + textContent              (in-place)
+
+Headline:
+  - sub-row scroll:      0 allocations, 0 updates (Object.is cutoff)
+  - boundary scroll:     0 allocations, ~370 updates per row crossed
+  - 1000-row jump:       0 allocations, ~384 updates total
+  - 10K boundary scrolls: signal nodes delta 0, signal links delta 0,
+                          DOM pool delta 0, process heap noise floor
+  - mount 1M rows:       ~56ms, 24-element pool, constant vs dataset size
+
+The reactive graph and DOM pool are stable across all steady-state ops.
+Allocations happen only during mount and on demand (column reorder may
+trigger grid-column updates, but no new DOM).
+
+## Conventions
+
+- ASCII-only source. Exceptions allowed: \u00d7 and \u00b5 (none used here).
+- Unicode in source as \u escapes (sort arrows: \u25b2 \u25bc).
+- No runtime deps beyond peers.
+- Author: Zahary Shinikchiev. License: MIT.
+- Zero-GC discipline: pre-allocate, reuse slots, no per-frame closures.
