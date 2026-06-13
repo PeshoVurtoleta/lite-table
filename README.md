@@ -10,7 +10,7 @@
 [![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-table?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-table)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Types-informational)
 ![Dependencies](https://img.shields.io/badge/dependencies-3-brightgreen)
-[![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
+[![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE.txt)
 
 ```bash
 npm install @zakkster/lite-table \
