@@ -2,6 +2,7 @@
   "name": "@zakkster/lite-table",
   "version": "1.0.0",
   "description": "Headless reactive data tables on @zakkster/lite-signal. CSS Grid (no <table>), pooled slots that never reparent, aria-activedescendant focus model. Zero-GC scroll path on @zakkster/lite-virtual.",
+  "sideEffects": false,
   "keywords": [
     "table",
     "datagrid",
@@ -52,6 +53,19 @@
   "engines": {
     "node": ">=20"
   },
+  "homepage": "https://github.com/PeshoVurtoleta/lite-signal#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-signal.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-signal/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
+  },
   "license": "MIT",
-  "author": "Zahary Shinikchiev"
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>"
 }
