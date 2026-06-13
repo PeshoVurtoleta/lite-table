@@ -594,16 +594,17 @@ Two tiers, all reproducible.
 
 ### Tier 1 -- Behavior (unit tests, fast)
 
-`npm test` runs the suite in `test/`, covering:
+`npm test` runs the suite in `test/`, 110 tests across 9 files:
 
 - **`core.test.js`** -- `createTable` API surface, reactive `visibleColumns`, `colTemplate`, `colPlacement` consistency under hide/pin/reorder, sort chain semantics, dispose idempotency.
 - **`dom.test.js`** -- `mountTable` produces correct DOM structure, header cells, slot pool sized to viewport, ARIA roles + indices, `aria-activedescendant` updates on focus moves, dispose tears down all bindings.
-- **`recycle.test.js`** -- slot pool reuse across boundary crosses; 1k scrolls leave the DOM tree byte-for-byte identical (only `textContent` and `style.transform` differ).
-- **`alloc.test.js`** -- scroll, sort, and column-reorder paths allocate no new signal nodes or links once warmed up.
-- **`sort.test.js`** -- multi-key sort chain stability, null-safe comparator default, custom `compare` per column, sort toggle cycle (none right asc right desc right none), index-buffer reuse.
-- **`selection.test.js`** -- single / toggle / additive / range modes, anchor preservation across sort, `selectAll` on filtered subsets.
-- **`columns.test.js`** -- `setColumnWidth` clamping, `setColumnHidden`, `setColumnPin`, `setColumnFlex` and the **pinning-suspends-flex** invariant (regression for the offset-vs-rendered-width mismatch), `moveColumn` cases including no-op self-move, `colTemplate` segment count consistency with `colPlacement`.
+- **`recycle.test.js`** -- slot pool reuse across boundary crosses; cell IDs follow the row, not the slot; logical focus survives scroll-out + filter-out + re-add.
+- **`alloc.test.js`** -- scroll, sort, and column-reorder paths allocate no new signal nodes or links once warmed up; 5000 boundary scrolls produce zero graph growth.
+- **`sort.test.js`** -- multi-key sort chain stability, null-safe comparator default, custom `compare` per column, sort toggle cycle (none -> asc -> desc -> none), index-buffer reuse.
+- **`selection.test.js`** -- single / toggle / additive / range modes, anchor preservation across sort, `selectAll` O(1) all-mode + blacklist, `forEachSelected` streaming.
+- **`columns.test.js`** -- `setColumnWidth` clamping, `setColumnHidden`, `setColumnPin`, `setColumnFlex` and the **pinning-suspends-flex** invariant (regression for the offset-vs-rendered-width mismatch), `moveColumn` cases, `colTemplate` segment count consistency with `colPlacement`.
 - **`keyboard.test.js`** -- `moveFocus` arrow / Home / End / PageUp / PageDown, focus clamps at edges, focus survives row reorder.
+- **`extras.test.js`** -- `scrollToIndex` × 3 align modes, pointer-driven column resize + reorder, `injectStyles:false`, mount-disposes-table lifecycle, null / zero / string-ID cells, `addSort(null)` removal, `moveFocus` from null focus, 50-column stress, steady-state graph stability under 1000 sort flips + 1000 selection toggles + 500 resize ops.
 
 ```bash
 npm test
@@ -614,7 +615,7 @@ npm test
 The `03-heap.js` bench is the production-style memory invariant: 10,000 boundary scrolls, 100,000 rows, must show **zero signal-node growth, zero link growth, zero pool growth**, and a heap delta inside V8's noise floor.
 
 ```bash
-npm run bench -- 03-heap
+node --expose-gc bench/03-heap.js
 ```
 
 If this fails, something allocates in the hot scroll path and we want to find it before publish.
@@ -782,13 +783,18 @@ Two patterns. Either render a checkbox character in the cell's `accessor` (`acce
 ## npm scripts
 
 ```bash
-npm test           # 80 tests across 8 files, node:test runner, --expose-gc
-npm run demo       # zero-dep static server, opens demo/index.html on :8000
-npm run bench      # all four benches sequentially
-npm run bench:01   # only the scroll-writes bench
-npm run bench:02   # only the mount cost bench
-npm run bench:03   # only the heap stability bench
-npm run bench:04   # only the sort bench
+npm test           # 110 tests across 9 files (node:test, --expose-gc)
+npm run demo       # zero-dep static server on http://localhost:8080
+npm run bench      # all four benches sequentially (output: text or --md)
+```
+
+To run a single bench, invoke it directly:
+
+```bash
+node --expose-gc bench/01-scroll-writes.js
+node --expose-gc bench/02-mount.js
+node --expose-gc bench/03-heap.js
+node --expose-gc bench/04-sort.js
 ```
 
 ---

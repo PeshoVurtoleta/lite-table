@@ -228,7 +228,7 @@ Table.js          single-file ESM source
 Table.d.ts        type declarations
 demo/index.html   QA demo with controls for all M1 features
 demo/serve.js     zero-dep static server (npm run demo)
-test/*.test.js    node:test suite (npm test, 72 tests)
+test/*.test.js    node:test suite (npm test, 110 tests across 9 files)
 bench/*.js        benchmarks vs clusterize.js + naive virtual (npm run bench)
 llms.txt          this file
 README.md         human docs with Mermaid diagrams + bench numbers

@@ -190,6 +190,51 @@ function readCell(col, row) {
 // 3. HEADLESS CORE
 // =============================================================================
 
+/**
+ * Create the headless reactive state for a table. Renderer-agnostic and
+ * SSR-safe; mount it with {@link mountTable} or render it yourself.
+ *
+ * Everything reactive lives in lite-signal nodes -- `visibleRows`,
+ * `visibleColumns`, `colTemplate`, `sortChain`, `focusedCell`, `selection`,
+ * `selectedCount` are all live and observable. Mutations go through the
+ * imperative methods (`setSort`, `selectRow`, `setColumnWidth`, ...) which
+ * write into those signals. See `Table.d.ts` for the full type contract.
+ *
+ * @template Row
+ * @param {object} config
+ * @param {readonly Row[] | (() => readonly Row[])} config.rows
+ *      Row source. A plain array is read once at mount; a signal getter or
+ *      function is re-read on each `visibleRows` recompute -- when wrapping
+ *      a signal, just pass the signal itself.
+ * @param {readonly object[]} config.columns
+ *      Column definitions. Non-empty; see {@link ColumnDef}. The first
+ *      column with `flex > 0` becomes the space absorber on resize.
+ * @param {(row: Row) => string|number} config.getRowId
+ *      REQUIRED. Stable identity per row -- selection, focus, and cell IDs
+ *      key off this. Returning the same id twice across the dataset breaks
+ *      slot reconciliation and ARIA `aria-activedescendant`.
+ * @param {number} [config.rowHeight=32]
+ * @param {number} [config.overscan=4]
+ *      Extra rows rendered above / below the viewport for smoother scroll.
+ * @param {{rowId: string|number, columnKey: string} | null} [config.initialFocus=null]
+ * @param {readonly {key: string, dir: "asc"|"desc"}[]} [config.initialSort=[]]
+ *
+ * @returns {object} TableCore -- the reactive state surface. See `Table.d.ts`.
+ * @throws {TypeError} If `getRowId` is missing, `columns` is empty, or
+ *      `rowHeight <= 0`.
+ *
+ * @example
+ *   const table = createTable({
+ *       rows: [{ id: 1, name: "Ada" }, { id: 2, name: "Linus" }],
+ *       columns: [
+ *           { key: "id", header: "ID", width: 60 },
+ *           { key: "name", header: "Name", width: 200, flex: 1 }
+ *       ],
+ *       getRowId: (r) => r.id
+ *   });
+ *   table.setSort("name", "asc");
+ *   table.selectRow(1);
+ */
 export function createTable(config) {
     if (!config) throw new TypeError("lite-table: config required");
     const {
@@ -631,14 +676,23 @@ export function createTable(config) {
         const cols = visibleColumns();
         if (!list.length || !cols.length) return;
         const cur = focusedCell();
+        // No focus yet -> seed at the first cell. Without this, ArrowDown
+        // from a null focus lands on row 1 (impl treats null as row -1 then
+        // moves down to 0+1), which surprises keyboard users who expect the
+        // first arrow to PUT them in the grid, not move them past row 0.
+        if (!cur) {
+            focusedCell.set({
+                rowId: getRowId(list[0]),
+                columnKey: cols[0].key
+            });
+            return;
+        }
         let rIdx = -1, cIdx = -1;
-        if (cur) {
-            for (let i = 0; i < list.length; i++) {
-                if (getRowId(list[i]) === cur.rowId) { rIdx = i; break; }
-            }
-            for (let i = 0; i < cols.length; i++) {
-                if (cols[i].key === cur.columnKey) { cIdx = i; break; }
-            }
+        for (let i = 0; i < list.length; i++) {
+            if (getRowId(list[i]) === cur.rowId) { rIdx = i; break; }
+        }
+        for (let i = 0; i < cols.length; i++) {
+            if (cols[i].key === cur.columnKey) { cIdx = i; break; }
         }
         if (rIdx < 0) rIdx = 0;
         if (cIdx < 0) cIdx = 0;
@@ -872,6 +926,11 @@ function injectStyles(doc) {
 }
 
 // Test hook.
+/**
+ * @internal
+ * Reset the styles-injected WeakSet so tests can re-assert injection
+ * behaviour from a clean slate. Not part of the public API.
+ */
 export function _resetStylesForTest() {
     _stylesInjected = new WeakSet();
 }
@@ -882,6 +941,42 @@ export function _resetStylesForTest() {
 
 const DRAG_THRESHOLD_PX = 4;
 
+/**
+ * Render a {@link createTable} core into a host element. Wires up CSS Grid
+ * layout, slot-pooled virtualization (constant DOM cost regardless of dataset
+ * size), reactive cell bindings, header sort / drag-reorder / drag-resize,
+ * pointer + keyboard handlers, and ARIA wiring (`role=grid`, `aria-rowcount`,
+ * `aria-activedescendant`).
+ *
+ * **Lifecycle coupling**: `mount.dispose()` also calls `table.dispose()`.
+ * One mount owns one table. To render the same data in two places, create
+ * two tables sharing the same row source.
+ *
+ * @template Row
+ * @param {HTMLElement} host
+ *      Container element. The mount takes one child and lives there until
+ *      `dispose()` removes it. Should have a non-zero `clientHeight` for
+ *      virtualization to size the pool; defaults to `initialViewportHeight`
+ *      while layout settles.
+ * @param {object} table  TableCore from {@link createTable}.
+ * @param {object} [options]
+ * @param {boolean} [options.injectStyles=true]
+ *      When false, the consumer is responsible for `.lt-*` CSS. The mount
+ *      still applies inline `style.--lt-cols` and per-cell `grid-column`
+ *      placements (which are required for the grid to lay out at all).
+ * @param {number} [options.initialViewportHeight=480]
+ *      Used to size the slot pool before the ResizeObserver fires.
+ *
+ * @returns {object} TableMount -- `{ root, viewport, axis, scrollToIndex, poolSize, dispose }`.
+ * @throws {TypeError} If `host` or `table` is missing.
+ *
+ * @example
+ *   const table = createTable({ ... });
+ *   const m = mountTable(document.getElementById("grid"), table);
+ *   m.scrollToIndex(500, "center");
+ *   // ... later
+ *   m.dispose();
+ */
 export function mountTable(host, table, options) {
     if (!host) throw new TypeError("lite-table: host element required");
     if (!table) throw new TypeError("lite-table: table required");

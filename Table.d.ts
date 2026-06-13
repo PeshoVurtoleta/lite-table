@@ -183,6 +183,19 @@ export interface TableCore<Row = any> {
 
     // ---- Lifecycle ----
     dispose(): void;
+
+    /**
+     * @internal
+     * Reactive scope used internally to track signals/computeds/effects
+     * created by this table. Exposed so tests can register additional
+     * effects whose disposal is tied to `table.dispose()`. Not for
+     * application use -- the public surface above covers all intended
+     * patterns.
+     */
+    readonly _scope: {
+        effect(fn: () => void): () => void;
+        onCleanup(fn: () => void): void;
+    };
 }
 
 export function createTable<Row = any>(
