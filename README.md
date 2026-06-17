@@ -8,8 +8,9 @@
 [![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-table?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-table)
 [![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-table?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-table)
 [![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-table?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-table)
+[![lite-signal peer](https://img.shields.io/npm/dependency-version/@zakkster/lite-table/peer/@zakkster/lite-signal?style=for-the-badge&color=blue)](https://github.com/PeshoVurtoleta/lite-signal)
 ![TypeScript](https://img.shields.io/badge/TypeScript-Types-informational)
-![Dependencies](https://img.shields.io/badge/dependencies-3-brightgreen)
+![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE.txt)
 
 ```bash
@@ -48,6 +49,9 @@ Synchronous, virtual, allocation-free in the steady state. A 100,000-row scroll 
 - [Architecture in one diagram](#architecture-in-one-diagram)
 - [How a scroll propagates](#how-a-scroll-propagates)
 - [API reference](#api-reference)
+- [Export](#export)
+- [Cell editing](#cell-editing)
+- [Per-column filtering](#per-column-filtering)
 - [Pinning and sticky offsets](#pinning-and-sticky-offsets)
 - [Flex columns](#flex-columns)
 - [Sorting](#sorting)
@@ -366,9 +370,283 @@ table.isSelected(rowId)
 table.moveFocus(direction)                // "up" | "down" | "left" | "right" | "home" | "end" | "pageUp" | "pageDown"
 table.cellId(rowId, columnKey)            // stable string id (matches DOM)
 
+// Filters (M2)
+table.setColumnFilter(key, value)         // null/""/whitespace clears that column
+table.clearColumnFilters()                // clear all
+table.columnFilters()                     // ReadonlyMap<string, string>
+table.filteredRows()                      // computed: rows post-filter, pre-sort
+
+// Editing (M2)
+table.startEdit(rowId, columnKey)         // no-op on non-editable columns
+table.commitEdit()                        // reads editingDraft
+table.commitEdit(explicitValue)           // commit a specific value
+table.cancelEdit()                        // discard; no onCellEdit call
+table.isEditing(rowId, columnKey)         // O(1) predicate
+table.editingCell()                       // { rowId, columnKey } | null
+table.editingDraft()                      // current in-progress string
+
+// Export (M1.1)
+table.exportCsv({ rows?, columns?, delimiter?, quote?, headers?, newline?, bom?, formatter? })   // → string
+table.exportJson({ rows?, columns?, indent?, format?, formatter? })                              // → string | object[]
+
 // Lifecycle
 table.dispose()
 ```
+
+---
+
+## Export
+
+`exportCsv` and `exportJson` materialize a row source into a string (or, for JSON, an array). Both methods take the same `rows` and `columns` selectors plus their own format-specific options.
+
+### `rows` source
+
+| Value         | Meaning                                                                          |
+| ------------- | -------------------------------------------------------------------------------- |
+| `"visible"`   | The current `visibleRows()`. Honors sort + the row source (post-pagination view). **Default.** |
+| `"all"`       | `rowsGetter()` -- the raw source you gave to `createTable`. If you gave a function (paginated source), this is the current page, NOT the master. See pitfall below. |
+| `"selected"`  | The current selection materialized against `rowsGetter()`. Same caveat as `"all"`. |
+| `Array`       | An explicit row array (e.g. a master array held externally).                     |
+
+**Paginated-getter pitfall**: if `createTable({ rows: () => allRows.slice(...) })` is a paginated function, `"all"` and `"selected"` resolve against that function -- which returns only the current page. To export beyond the page, pass the master array explicitly:
+
+```js
+table.exportCsv({ rows: allRows });                          // entire master
+table.exportCsv({ rows: table.selectedRows(allRows) });      // selected across master
+```
+
+### `columns` selector
+
+| Value           | Meaning                                                          |
+| --------------- | ---------------------------------------------------------------- |
+| `"visible"`     | `visibleColumns()` -- honors hide state + current order. **Default.** |
+| `"all"`         | All declared columns in declaration order, including hidden.     |
+| `Array<string>` | Explicit projection by key. Order in the output matches array order. Unknown keys are silently dropped. |
+
+### `exportCsv` options
+
+| Option       | Type                       | Default   | Notes                                          |
+| ------------ | -------------------------- | --------- | ---------------------------------------------- |
+| `delimiter`  | `string`                   | `","`     | `"\t"` for TSV, `";"` for European regional    |
+| `quote`      | `string`                   | `'"'`     | Per RFC 4180; embedded quotes are doubled      |
+| `headers`    | `boolean`                  | `true`    | Emit header row                                |
+| `newline`    | `string`                   | `"\r\n"`  | RFC 4180 says CRLF; `"\n"` works for most consumers |
+| `bom`        | `boolean`                  | `false`   | Prepend UTF-8 BOM for Excel-on-Windows         |
+| `formatter`  | `(row, col) => unknown`    | -         | Per-cell formatter, runs before CSV escaping   |
+
+CSV escaping follows RFC 4180: a field is quoted if it contains the delimiter, the quote character, CR, or LF. Embedded quotes are doubled. The column's `accessor` (if any) is honored.
+
+### `exportJson` options
+
+| Option      | Type                       | Default      | Notes                                                            |
+| ----------- | -------------------------- | ------------ | ---------------------------------------------------------------- |
+| `indent`    | `number`                   | `0`          | `JSON.stringify` indent; 0 = single-line compact                 |
+| `format`    | `"string"` \| `"array"`    | `"string"`   | `"array"` skips JSON.stringify and returns the projected array   |
+| `formatter` | `(row, col) => unknown`    | -            | Per-cell formatter                                               |
+
+Fast path: `exportJson({ columns: "all", format: "array" })` with no formatter returns a shallow `rows.slice()` -- the row objects themselves, not copies. Use this when piping into IndexedDB / postMessage / structured clone.
+
+### Triggering a browser download
+
+The methods return strings; the consumer handles the download:
+
+```js
+function downloadFile(text, filename, mime) {
+    const blob = new Blob([text], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+downloadFile(table.exportCsv({ bom: true }), "data.csv", "text/csv;charset=utf-8");
+```
+
+The BOM (`bom: true`) is the difference between Excel opening your file as UTF-8 vs garbling non-ASCII characters on Windows.
+
+---
+
+## Cell editing
+
+Opt-in per column via `editable: true`. When set, double-click (or `F2` / `Enter` on the focused cell) puts the cell into `contenteditable` mode with its current value pre-selected. Enter commits, Tab commits + moves to the next cell, Escape cancels.
+
+```js
+const table = createTable({
+    rows,
+    columns: [
+        { key: "id", width: 60 },
+        { key: "name", editable: true },
+        { key: "email", editable: true },
+        { key: "joined" },                  // not editable -- no double-click affordance
+    ],
+    getRowId: r => r.id,
+    onCellEdit: ({ row, columnKey, oldValue, newValue }) => {
+        // Mutate the row, send to backend, dispatch to a store, whatever.
+        // lite-table does NOT mutate the row for you.
+        row[columnKey] = newValue;
+    },
+});
+
+mountTable(host, table);
+```
+
+### Commit semantics
+
+- **Enter** commits + moves focus to the row below (spreadsheet idiom)
+- **Tab** / **Shift+Tab** commit + move focus right / left
+- **Blur** (clicking outside, focusing another cell) commits
+- **Escape** cancels: edit state cleared, no `onCellEdit` call
+- **A second `startEdit` on a different cell** auto-commits the first
+- **A `startEdit` on the same cell** is a no-op (does not re-seed the draft)
+- `commitEdit` skips `onCellEdit` when the new value equals the old value (string-coerced: see below), so accidental Enter-without-typing is free even on numeric / typed columns
+
+The `onCellEdit` handler is called with `{ row, columnKey, oldValue, newValue }`. The table does **not** mutate the row -- the handler is the consumer's hook to write somewhere (the row, a backend, a store). Throwing from the handler is caught + logged; subsequent edits work normally.
+
+### `newValue` is always a string
+
+When the edit comes from the DOM (double-click → contenteditable → Enter / Tab / blur), `newValue` is whatever the user typed: **always a string**. lite-table doesn't try to guess that "100" should be a number or "true" should be a boolean -- that's the consumer's call.
+
+For non-string columns, coerce inside your handler:
+
+```js
+onCellEdit: ({ row, columnKey, newValue }) => {
+    if (columnKey === "count")      row.count = Number(newValue);
+    else if (columnKey === "active") row.active = newValue === "true";
+    else if (columnKey === "due")    row.due = new Date(newValue);
+    else                              row[columnKey] = newValue;
+},
+```
+
+The **unchanged-guard** compares `String(oldValue) !== newValue` for string `newValue`s (the common case from the DOM), so pressing Enter on a numeric column without typing doesn't fire your handler -- `100` and `"100"` aren't strict-equal but they're "unchanged" from the user's perspective. When you call `commitEdit(explicitValue)` with a non-string explicit value, the guard falls back to strict equality so you have predictable control.
+
+### Reactive surface
+
+```js
+table.editingCell()        // { rowId, columnKey } | null
+table.editingDraft()       // current in-progress string
+table.isEditing(rowId, columnKey)   // O(1) predicate
+
+table.startEdit(rowId, columnKey)
+table.commitEdit()         // reads editingDraft
+table.commitEdit("explicit value")
+table.cancelEdit()
+```
+
+### Programmatic editing
+
+Skip the double-click affordance entirely if you want -- `startEdit` is the only entry point you need. Use it for "edit on selection", per-row action menus, or hotkey-triggered batch edits:
+
+```js
+// "Edit name on selected row" toolbar button:
+editNameBtn.addEventListener("click", () => {
+    const f = table.focusedCell();
+    if (f) table.startEdit(f.rowId, "name");
+});
+```
+
+### Editing + reactive row sources
+
+If your `rows` is a function (paginated, filtered, etc.), the edited row may scroll out of view mid-edit. The edit state is keyed on `rowId`, so:
+
+- The slot DOM gets recycled to show a different row; `contenteditable` is removed from the recycled cell automatically.
+- The `editingCell` signal stays set, pointing at the row that's no longer visible.
+- When that row scrolls back into view, the cell becomes `contenteditable` again with the draft preserved.
+
+This is the spreadsheet idiom too -- you can scroll while typing without losing your input. To force a commit, call `table.commitEdit()` from your scroll handler if you want stricter semantics.
+
+### Performance
+
+Editable columns use one extra reactive effect per cell (the contenteditable management) and add two event listeners (input, keydown) plus two more on dblclick and blur. The text effect on editable cells skips its `textContent` write while the cell is the active edit target, so user keystrokes don't fight a reactive paint. Non-editable columns pay nothing -- the editing machinery is gated on `col.editable` and never attaches.
+
+---
+
+## Per-column filtering
+
+Opt-in per column via `filterable: true`. A filter row appears between the header and the viewport, with one `<input>` per filterable column. The default predicate is case-insensitive substring match on the stringified cell value (after the column's `accessor` runs); pass a custom `filter` for richer semantics.
+
+```js
+const table = createTable({
+    rows,
+    columns: [
+        { key: "id", width: 70 },
+        { key: "name",  filterable: true },                        // default substring
+        { key: "email", filterable: true, filterPlaceholder: "name@domain" },
+        { key: "role",  filterable: true, filterPlaceholder: "engineer / pm / …" },
+        { key: "salary", filterable: true,
+          // ">N" / "<N" / "N" exact / substring fallback
+          filter: (v, q) => {
+              if (q.startsWith(">")) {
+                  const n = Number(q.slice(1));
+                  return Number.isFinite(n) && v > n;
+              }
+              if (q.startsWith("<")) {
+                  const n = Number(q.slice(1));
+                  return Number.isFinite(n) && v < n;
+              }
+              const n = Number(q);
+              if (Number.isFinite(n)) return v === n;
+              return String(v).indexOf(q) >= 0;
+          },
+          filterPlaceholder: ">100k" },
+    ],
+    getRowId: r => r.id,
+});
+```
+
+### Predicate contract
+
+```ts
+(value: unknown, query: string, row: Row) => boolean
+```
+
+- `value` is the column's value (post-`accessor`)
+- `query` is the trimmed filter input. Empty / whitespace-only queries are treated as "no filter" and your predicate is not invoked for them
+- `row` is the full row object -- handy for cross-field filters (e.g., "show rows where `firstName + lastName` matches")
+
+Filters from multiple columns AND together. A row must pass every active filter to remain visible.
+
+### Filter order in the pipeline
+
+```
+rowsGetter() → filteredRows → visibleRows → exports / mount / etc.
+                  ▲              ▲
+                  │              └─ sort applied here
+                  └─ filters applied here
+```
+
+This means **export of `rows: "visible"` is already filtered + sorted**, which is what you want for "export what the user sees". For "export the master regardless of filters/sort", use `rows: "all"` or pass the master array explicitly.
+
+### Reactive surface
+
+```js
+table.columnFilters()                 // ReadonlyMap<string, string>
+table.filteredRows()                  // computed: rows post-filter, pre-sort
+table.setColumnFilter("role", "eng")  // set
+table.setColumnFilter("role", "")     // clear that column
+table.setColumnFilter("role", null)   // also clears
+table.clearColumnFilters()            // clear all
+```
+
+The filter row's inputs are bound two-way to `columnFilters`. If you mutate the signal programmatically (e.g., to restore filter state from a URL), the inputs update automatically.
+
+### Keyboard
+
+- **Escape** on a filter input clears that column's filter (the input clears too)
+- The filter row is part of the focusable tab order; Tab moves to the next filter input or to the next focusable element after the row
+
+### Hiding the filter row
+
+The filter row is only mounted if at least one declared column has `filterable: true`. To temporarily hide it without un-mounting, hide all filterable columns (`setColumnHidden`); their filter cells go to `display: none` with the rest of the column.
+
+### Performance
+
+Filtering is O(N) over the source rows on every filter change, executed inside a single computed. With 5000 rows + a handful of filterable columns, this runs in under a millisecond in our demo. The filtered array is a fresh allocation per change (Object.is inequality is required to notify the sort + selection downstream); for million-row data sources you typically want backend filtering anyway.
+
+The fast path returns the source array identity when no filter is active, so just enabling `filterable: true` on columns costs nothing until the user types something.
 
 ---
 
@@ -722,6 +1000,68 @@ async function loadPage(n) {
 ```
 
 `rows.set(next)` invalidates `visibleRows`, which causes the slot pool's text effects to re-pull. The DOM topology is unchanged -- same 24 row elements, same N cells per row, new text content.
+
+</details>
+
+<details>
+<summary>Client-side pagination via a reactive row source (M1.1 pattern).</summary>
+
+The reactive `rows: () => ...` getter form makes pagination effectively free: the page index and page size are signals, and `visibleRows` derives from both. Changing either signal triggers `visibleRows` to recompute the slice -- the slot pool's text effects re-pull, and the DOM topology stays unchanged.
+
+```js
+import { signal, computed } from "@zakkster/lite-signal";
+import { createTable, mountTable } from "@zakkster/lite-table";
+
+const allRows = await fetchEverything();   // your master array
+
+const pageSize  = signal(25);
+const pageIndex = signal(0);   // 0-based
+
+const pageCount = computed(() => {
+    const sz = pageSize();
+    return sz === 0 ? 1 : Math.max(1, Math.ceil(allRows.length / sz));
+});
+
+const table = createTable({
+    rows: () => {
+        const sz = pageSize();
+        if (sz === 0) return allRows;
+        const start = pageIndex() * sz;
+        return allRows.slice(start, start + sz);
+    },
+    columns: COLS,
+    getRowId: r => r.id,
+});
+
+mountTable(host, table);
+
+// Page-size dropdown
+pageSizeSelectEl.addEventListener("change", (e) => {
+    pageSize.set(Number(e.target.value));
+    pageIndex.set(0);   // reset to first page when size changes
+});
+
+// First / prev / next / last
+firstBtn.addEventListener("click", () => pageIndex.set(0));
+prevBtn.addEventListener("click",  () => pageIndex.set(Math.max(0, pageIndex() - 1)));
+nextBtn.addEventListener("click",  () => pageIndex.set(Math.min(pageCount() - 1, pageIndex() + 1)));
+lastBtn.addEventListener("click",  () => pageIndex.set(pageCount() - 1));
+```
+
+The slot pool isn't recreated when the page changes -- the same 24 row elements re-bind to the new slice. A `setPageSize(100)` after browsing to page 50 just sets two signals and the next paint is the new page.
+
+**Exporting a paginated table**: because `rows: "all"` and `rows: "selected"` resolve against `rowsGetter()` (which IS your paginated function), those selectors give you the current page only. To export across the master, pass the master array explicitly:
+
+```js
+// Just the current page (what the user sees):
+table.exportCsv();                                            // rows: "visible"
+
+// All 5000 rows (the master):
+table.exportCsv({ rows: allRows });
+
+// All rows the user picked (Select-All across all pages):
+table.exportCsv({ rows: table.selectedRows(allRows) });
+```
 
 </details>
 

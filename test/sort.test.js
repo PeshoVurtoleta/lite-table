@@ -76,6 +76,70 @@ test("sort: toggleSort additive builds and reduces the chain", () => {
     t.dispose();
 });
 
+test("sort: plain click on a column in a multi-col chain toggles asc<->desc, never removes (chain preserved)", () => {
+    // Without this rule, every plain click on a chained header risks pruning
+    // chain entries on the third click (asc -> desc -> removed cycle). That
+    // surprises users who carefully built a multi-column sort: one stray
+    // plain-click on a chained desc column would silently lose that column.
+    // New rule: plain-click on a chained column is asc <-> desc only. To
+    // remove from chain, use shift-click (which still cycles asc -> desc ->
+    // removed) or clearSort().
+    const t = createTable({ rows: ROWS, columns: COLS, getRowId: (r) => r.id });
+    t.toggleSort("id");
+    t.toggleSort("name",  { additive: true });
+    t.toggleSort("value", { additive: true });
+    assert.equal(t.sortChain().length, 3, "chain of 3 built via shift-click");
+
+    // Plain-click `name` (middle, asc) -> flips to desc, chain length preserved.
+    t.toggleSort("name");
+    assert.equal(t.sortChain().length, 3, "chain length preserved on flip");
+    assert.deepEqual(
+        t.sortChain().map((e) => e.key + ":" + e.dir),
+        ["id:asc", "name:desc", "value:asc"]
+    );
+
+    // Plain-click `name` AGAIN (was desc) -> flips back to asc, NOT removed.
+    // This is the key behavior change from the old 3-state cycle.
+    t.toggleSort("name");
+    assert.equal(t.sortChain().length, 3, "chain length still preserved on second flip");
+    assert.deepEqual(
+        t.sortChain().map((e) => e.key + ":" + e.dir),
+        ["id:asc", "name:asc", "value:asc"]
+    );
+
+    // Same for an unchanged column at the top of the chain.
+    t.toggleSort("id"); // asc -> desc, chain preserved
+    t.toggleSort("id"); // desc -> asc, chain preserved
+    assert.equal(t.sortChain().length, 3);
+
+    // To actually remove a chain entry the user must shift-click it through
+    // the 3-state cycle (asc -> desc -> remove).
+    t.toggleSort("name", { additive: true }); // asc -> desc
+    t.toggleSort("name", { additive: true }); // desc -> removed
+    assert.equal(t.sortChain().length, 2);
+    assert.deepEqual(t.sortChain().map((e) => e.key), ["id", "value"]);
+
+    // Plain-click an UN-chained column STILL replaces (resets to single sort).
+    // "name" was just removed above, so it counts as un-chained again.
+    t.toggleSort("name");
+    assert.deepEqual(t.sortChain(), [{ key: "name", dir: "asc" }]);
+    t.dispose();
+});
+
+test("sort: plain click cycle on single-column chain stays asc->desc->cleared (legacy)", () => {
+    // Single-column chains keep the 3-state legacy cycle: some users rely
+    // on a third plain click to fully unsort. The 2-state rule only applies
+    // when chain.length > 1.
+    const t = createTable({ rows: ROWS, columns: COLS, getRowId: (r) => r.id });
+    t.toggleSort("name");
+    assert.deepEqual(t.sortChain(), [{ key: "name", dir: "asc" }]);
+    t.toggleSort("name");
+    assert.deepEqual(t.sortChain(), [{ key: "name", dir: "desc" }]);
+    t.toggleSort("name");
+    assert.deepEqual(t.sortChain(), []);
+    t.dispose();
+});
+
 test("sort: clearSort empties the chain", () => {
     const t = createTable({
         rows: ROWS, columns: COLS, getRowId: (r) => r.id,

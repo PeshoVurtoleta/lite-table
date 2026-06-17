@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-table",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Headless reactive data tables on @zakkster/lite-signal. CSS Grid (no <table>), pooled slots that never reparent, aria-activedescendant focus model. Zero-GC scroll path on @zakkster/lite-virtual.",
   "sideEffects": false,
   "keywords": [
@@ -24,8 +24,10 @@
   "types": "./Table.d.ts",
   "exports": {
     ".": {
+      "node": "./Table.js",
+      "import": "./Table.js",
       "types": "./Table.d.ts",
-      "import": "./Table.js"
+      "default": "./Table.js"
     }
   },
   "files": [
@@ -42,24 +44,26 @@
     "bench": "node --expose-gc --max-old-space-size=4096 bench/run.js"
   },
   "peerDependencies": {
-    "@zakkster/lite-signal": "^1.2.0",
+    "@zakkster/lite-signal": "^1.2.1",
     "@zakkster/lite-signal-dom": "^1.0.1",
     "@zakkster/lite-virtual": "^1.1.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "clusterize.js": "^1.0.0",
-    "happy-dom": "^15.11.7"
+    "happy-dom": "^15.11.7",
+    "playwright": "^1.60.0"
   },
   "engines": {
     "node": ">=20"
   },
-  "homepage": "https://github.com/PeshoVurtoleta/lite-signal#readme",
+  "homepage": "https://github.com/PeshoVurtoleta/lite-table#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/PeshoVurtoleta/lite-signal.git"
+    "url": "git+https://github.com/PeshoVurtoleta/lite-table.git"
   },
   "bugs": {
-    "url": "https://github.com/PeshoVurtoleta/lite-signal/issues",
+    "url": "https://github.com/PeshoVurtoleta/lite-table/issues",
     "email": "shinikchiev@yahoo.com"
   },
   "funding": {

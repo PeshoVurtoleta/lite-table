@@ -36,6 +36,17 @@ export interface ColumnDef<Row = any, Value = unknown> {
     pinnable?: boolean;
     hideable?: boolean;
     reorderable?: boolean;
+    /** M2: enable double-click / F2 cell editing for this column. Default false. */
+    editable?: boolean;
+    /** M2: enable the per-column filter input above this column. Default false. */
+    filterable?: boolean;
+    /** M2: custom filter predicate. Receives the column's value (post-accessor),
+     *  the current (trimmed) filter query string, and the full row. Return
+     *  true to keep the row in the result. Defaults to case-insensitive
+     *  substring match on the stringified value. */
+    filter?: (value: Value, query: string, row: Row) => boolean;
+    /** M2: placeholder text for the filter input. Default "Filter…". */
+    filterPlaceholder?: string;
     /** Computed value override; if absent, `row[key]` is used. */
     accessor?: (row: Row) => Value;
     /** Sort comparator; default is null-safe number-or-string compare. */
@@ -53,6 +64,11 @@ export interface ColumnState<Row = any> {
     readonly pinnable: boolean;
     readonly hideable: boolean;
     readonly reorderable: boolean;
+    /** M2 */
+    readonly editable: boolean;
+    readonly filterable: boolean;
+    readonly filter: ((value: unknown, query: string, row: Row) => boolean) | null;
+    readonly filterPlaceholder: string | null;
     readonly minWidth: number;
     readonly maxWidth: number;
     readonly width: Signal<number>;
@@ -66,6 +82,34 @@ export interface ColumnState<Row = any> {
 export interface FocusedCell {
     rowId: string | number;
     columnKey: string;
+}
+
+/** M2: cell currently being edited. Keyed on row identity so the edit
+ *  state survives slot recycling / scroll / sort / filter -- same model
+ *  as `FocusedCell`. */
+export interface EditingCell {
+    rowId: string | number;
+    columnKey: string;
+}
+
+/** M2: payload passed to `onCellEdit` on commit.
+ *
+ *  `newValue` is `string` when the commit came from the DOM editing path
+ *  (double-click / F2 → contenteditable → Enter / Tab / blur). The
+ *  consumer is responsible for coercion when editing typed columns. When
+ *  the consumer calls `commitEdit(explicitValue)` with a non-string,
+ *  `newValue` carries that value through unchanged (typed as unknown).
+ *  `oldValue` is whatever the cell holds pre-edit (post-accessor).
+ *
+ *  The unchanged-guard compares `String(oldValue) !== newValue` for string
+ *  `newValue`s -- so a no-op Enter on a numeric column doesn't fire this
+ *  handler. For non-string explicit values it falls back to strict
+ *  equality. */
+export interface CellEditPayload<Row = any> {
+    row: Row;
+    columnKey: string;
+    oldValue: unknown;
+    newValue: string | unknown;
 }
 
 export interface SortEntry {
@@ -102,6 +146,54 @@ export interface CreateTableConfig<Row = any> {
     overscan?: number;
     initialFocus?: FocusedCell | null;
     initialSort?: readonly SortEntry[];
+    /** M2: commit hook for cell edits. Receives the row + column key + old +
+     *  new value. The table does NOT mutate rows itself; consumer is
+     *  responsible for the data write (in-memory mutation, backend POST,
+     *  optimistic update, etc.). Skipped when newValue === oldValue.
+     *  Errors thrown by the handler are caught + logged. */
+    onCellEdit?: (payload: CellEditPayload<Row>) => void | Promise<unknown>;
+}
+
+// --- Export option types ----------------------------------------------------
+
+/** Row source for export.
+ *
+ *  - `"visible"` (default): the current post-sort view that the user sees.
+ *  - `"all"`: the original master `rows` array, ignoring sort.
+ *  - `"selected"`: the current selection materialized against the master
+ *    array (so the export order matches insertion order, not the sorted
+ *    order the user is looking at). Pass an explicit array if you want
+ *    a different source.
+ *  - Array: an explicit row array (e.g. a paginated page snapshot).
+ */
+export type ExportRowsSource<Row = any> = "visible" | "all" | "selected" | readonly Row[];
+
+/** Column projection for export.
+ *
+ *  - `"visible"` (default): column order matches the current visible order
+ *    and skips hidden columns.
+ *  - `"all"`: all declared columns in declaration order, including hidden.
+ *  - Array: explicit list of column keys (projection + ordering).
+ */
+export type ExportColumnsSelector = "visible" | "all" | readonly string[];
+
+export interface ExportCsvOptions<Row = any> {
+    rows?: ExportRowsSource<Row>;
+    columns?: ExportColumnsSelector;
+    delimiter?: string;
+    quote?: string;
+    headers?: boolean;
+    newline?: string;
+    bom?: boolean;
+    formatter?: (row: Row, col: ColumnState<Row>) => unknown;
+}
+
+export interface ExportJsonOptions<Row = any> {
+    rows?: ExportRowsSource<Row>;
+    columns?: ExportColumnsSelector;
+    indent?: number;
+    format?: "string" | "array";
+    formatter?: (row: Row, col: ColumnState<Row>) => unknown;
 }
 
 // --- Headless core ----------------------------------------------------------
@@ -116,6 +208,10 @@ export interface TableCore<Row = any> {
 
     // ---- Reactive: data ----
     rowsGetter(): readonly Row[];
+    /** M2: filtered rows BEFORE sort. `visibleRows` reads from this; consumers
+     *  can read it directly when they want filter-aware row materializers
+     *  (e.g. count of pre-sort matches, export of filtered-but-not-sorted). */
+    readonly filteredRows: Computed<readonly Row[]>;
     readonly visibleRows: Computed<readonly Row[]>;
     readonly rowCount: Computed<number>;
 
@@ -133,8 +229,12 @@ export interface TableCore<Row = any> {
     readonly leftOffsets: Computed<Map<string, number>>;
     readonly rightOffsets: Computed<Map<string, number>>;
 
-    // ---- Reactive: sort / focus / selection ----
+    // ---- Reactive: sort / filter / focus / selection / editing ----
     readonly sortChain: Signal<readonly SortEntry[]>;
+    /** M2: per-column filter state. Map<columnKey, queryString>. Mutated
+     *  via `setColumnFilter` -- direct .set on the signal works but always
+     *  pass a fresh Map (Object.is-equal mutations would not notify). */
+    readonly columnFilters: Signal<ReadonlyMap<string, string>>;
     readonly focusedCell: Signal<FocusedCell | null>;
     /** Predicate-based selection state. Reading `.set.has(id)` directly is
      *  wrong in all-mode -- use `isSelected(id)` for membership. */
@@ -143,6 +243,14 @@ export interface TableCore<Row = any> {
     /** Reactive O(1) selected count. In all-mode this is
      *  `rowCount() - blacklist.size`; otherwise `whitelist.size`. */
     readonly selectedCount: Computed<number>;
+    /** M2: current cell being edited, or null. Keyed on row identity so it
+     *  survives scroll / sort / filter / slot recycling. */
+    readonly editingCell: Signal<EditingCell | null>;
+    /** M2: in-progress edit value (the contenteditable's textContent).
+     *  mountTable writes to this from `input` events; consumers can also
+     *  set it programmatically to drive an external input. `commitEdit`
+     *  without an explicit value reads this. */
+    readonly editingDraft: Signal<string>;
 
     // ---- Methods: sort ----
     setSort(key: string, dir: SortDir | null): void;
@@ -177,6 +285,31 @@ export interface TableCore<Row = any> {
     setColumnFlex(key: string, flex: number): void;
     setColumnOrder(keys: readonly string[]): void;
     moveColumn(fromKey: string, toKey: string, opts?: { before?: boolean }): void;
+
+    // ---- Methods: filters (M2) ----
+    /** Set or clear a column's filter. Pass `null`/`undefined`/`""` to clear.
+     *  No-op on non-filterable or unknown columns. */
+    setColumnFilter(key: string, value: string | null | undefined): void;
+    /** Clear all filters. No-op + no notify if the filter map is already empty. */
+    clearColumnFilters(): void;
+
+    // ---- Methods: editing (M2) ----
+    /** Start editing the (rowId, columnKey) cell. No-op on non-editable
+     *  columns. Auto-commits any in-flight edit of a different cell. Idempotent
+     *  on the same cell (does not re-seed the draft). */
+    startEdit(rowId: string | number, columnKey: string): void;
+    /** Commit the in-flight edit. With no argument, reads from `editingDraft`.
+     *  Fires `onCellEdit` only when `newValue !== oldValue`. Clears edit state. */
+    commitEdit(value?: string): void;
+    /** Discard the in-flight edit without firing `onCellEdit`. */
+    cancelEdit(): void;
+    /** O(1) predicate. */
+    isEditing(rowId: string | number, columnKey: string): boolean;
+
+    // ---- Methods: export ----
+    exportCsv(opts?: ExportCsvOptions<Row>): string;
+    exportJson(opts?: ExportJsonOptions<Row> & { format?: "string" }): string;
+    exportJson<R = Row>(opts: ExportJsonOptions<Row> & { format: "array" }): object[];
 
     // ---- Methods: focus ----
     moveFocus(direction: FocusDirection, opts?: { pageSize?: number }): void;

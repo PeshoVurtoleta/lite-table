@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>@zakkster/lite-table M1 demo</title>
+<title>@zakkster/lite-table demo</title>
 <style>
     :root {
         color-scheme: dark;
@@ -16,6 +16,7 @@
         --muted: #94a3b8;
         --accent: #60a5fa;
         --accent-2: #3b82f6;
+        --warn: #f59e0b;
 
         /* Spacing scale -- in rem so the whole layout scales with the user's
            browser font-size setting. */
@@ -72,7 +73,7 @@
         overflow-y: auto;
         display: flex;
         flex-direction: column;
-        gap: 0.875rem;
+        gap: 0.5rem;        /* tightened from 0.875rem -- M2 added Filter + Export panels */
         min-height: 0;
     }
     aside h2 {
@@ -80,7 +81,7 @@
         text-transform: uppercase;
         letter-spacing: 0.06em;
         color: var(--muted);
-        margin: 0 0 var(--gap-sm);
+        margin: 0 0 var(--gap-xs);
         font-weight: 600;
     }
     .panel-group {
@@ -134,7 +135,7 @@
         grid-template-columns: 1fr auto;
         gap: var(--gap-xs);
         align-items: center;
-        padding: var(--gap-sm) 0;
+        padding: 0.25rem 0;
         border-bottom: 1px solid var(--border);
     }
     .col-row:last-child { border-bottom: 0; }
@@ -188,7 +189,7 @@
     footer .stat { font-variant-numeric: tabular-nums; }
     footer .stat b { color: var(--accent); font-weight: 600; }
 
-    .kbd-help { font-size: 0.6875rem; line-height: 1.6; color: var(--muted); }
+    .kbd-help { font-size: 0.6875rem; line-height: 1.5; color: var(--muted); }
     .kbd-help kbd {
         background: var(--panel-2);
         border: 1px solid var(--border-2);
@@ -275,10 +276,37 @@
     .lt-row.is-selected.lt-row-alt { background: #1e40af !important; }
     .lt-cell { border-color: var(--border) !important; }
     .lt-cell.is-focused { outline: 2px solid var(--accent) !important; outline-offset: -2px !important; }
+    .lt-cell.is-editing { outline: 2px solid var(--warn) !important; outline-offset: -2px !important; background: #1e1b1a !important; }
     .lt-header-resize { width: 0.5rem !important; }
     .lt-header-resize:hover, .lt-header-resize.is-active { background: var(--accent-2) !important; }
     .lt-header-cell.is-drop-before { box-shadow: 2px 0 0 var(--accent) inset !important; }
     .lt-header-cell.is-drop-after { box-shadow: -2px 0 0 var(--accent) inset !important; }
+
+    /* ------ M2: filter row + edit overrides for the dark theme -------------
+       The library's default `.lt-filter-row { top: 32px }` was designed
+       assuming the filter row would sit INSIDE the viewport (sticking below
+       the header during scroll). The actual implementation puts it OUTSIDE
+       the viewport, so the 32px offset just shifts the row down INTO the
+       header's stacking region -- the filter row with z-index:4 ends up
+       covering the header at z-index:3. Forcing top:0 puts the filter row
+       at its natural flex-column position above the viewport, where it
+       belongs. */
+    .lt-filter-row {
+        background: var(--bg) !important;
+        border-bottom-color: var(--border) !important;
+        top: 0 !important;
+    }
+    .lt-filter-cell[data-pin="left"],
+    .lt-filter-cell[data-pin="right"] { background: var(--bg) !important; }
+    .lt-filter-input {
+        background: var(--panel-2) !important;
+        color: var(--text) !important;
+        border-color: var(--border-2) !important;
+    }
+    .lt-filter-input:focus {
+        border-color: var(--accent) !important;
+        box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.25) !important;
+    }
 
     /* Bigger resize handle on touch. */
     @media (pointer: coarse) {
@@ -291,7 +319,7 @@
 <header>
     <button class="drawer-toggle" id="drawer-toggle" aria-label="Open controls" aria-controls="sidebar">&#9776;</button>
     <h1>@zakkster/lite-table</h1>
-    <span class="sub">M1 preview &middot; <b id="stat-header-rows">0</b> rows &middot; sort &middot; resize &middot; reorder &middot; pin &middot; hide &middot; selection &middot; keyboard</span>
+    <span class="sub">M2 preview &middot; <b id="stat-header-rows">0</b> rows &middot; sort &middot; filter &middot; edit &middot; resize &middot; reorder &middot; pin &middot; selection &middot; export</span>
 </header>
 
 <div class="backdrop" id="backdrop" aria-hidden="true"></div>
@@ -323,13 +351,22 @@
     </div>
 
     <div class="panel-group">
-        <h2>Sort</h2>
+        <h2>Sort &amp; Filter</h2>
         <div class="row">
             <button id="btn-clear-sort">Clear sort</button>
-            <span class="sub" id="stat-sort">none</span>
+            <button id="btn-clear-filters">Clear filters</button>
         </div>
+        <div class="row">
+            <button id="btn-multi-sort-demo"
+                    title="setSort('status','asc') + addSort('id','desc')">
+                Demo: Status &rarr; ID
+            </button>
+        </div>
+        <div class="sub" id="stat-sort-filter">sort: none &middot; filters: 0</div>
         <div class="kbd-help">
-            Click a header to sort. <kbd>Shift</kbd>+click to chain.
+            Click header to sort, <kbd>Shift</kbd>+click to chain.
+            Type below header to filter. <b>Value</b> accepts <code>&gt;500</code>,
+            <code>&lt;100</code>, exact number.
         </div>
     </div>
 
@@ -337,33 +374,42 @@
         <h2>Columns</h2>
         <div id="col-controls"></div>
         <div class="kbd-help">
-            Checkbox shows/hides column. <kbd>L</kbd> / <kbd>R</kbd> sticks the
-            column to the left / right edge during horizontal scroll.<br>
-            To reorder: drag a column header in the grid.
-            To resize: drag the right edge of a header.
+            Drag header to reorder, drag its right edge to resize.
+            <kbd>L</kbd> / <kbd>R</kbd> = pin to that edge.
         </div>
     </div>
 
     <div class="panel-group">
-        <h2>Selection</h2>
+        <h2>Selection &amp; Export</h2>
         <div class="row">
             <button id="btn-select-all">Select all</button>
             <button id="btn-clear-sel">Clear</button>
         </div>
-        <div class="sub" id="stat-sel">0 selected</div>
+        <div class="row">
+            <button id="btn-export-csv">CSV (visible)</button>
+            <button id="btn-export-csv-sel">CSV (selected)</button>
+        </div>
+        <div class="row">
+            <button id="btn-export-json">JSON (all)</button>
+            <span class="sub" id="stat-sel">0 selected</span>
+        </div>
     </div>
 
     <div class="panel-group">
         <h2>Keyboard (focus the grid first)</h2>
         <div class="kbd-help">
-            <kbd>&uarr;</kbd> <kbd>&darr;</kbd> <kbd>&larr;</kbd> <kbd>&rarr;</kbd> move focus<br>
-            <kbd>Home</kbd> / <kbd>End</kbd> row start / end<br>
-            <kbd>Ctrl</kbd>/<kbd>&#8984;</kbd>+<kbd>Home</kbd>/<kbd>End</kbd> grid corners<br>
-            <kbd>PgUp</kbd> / <kbd>PgDn</kbd> page jump<br>
-            <kbd>Space</kbd> toggle selection<br>
-            <kbd>Ctrl</kbd>/<kbd>&#8984;</kbd>+<kbd>A</kbd> select all<br>
-            <kbd>Esc</kbd> clear selection<br>
-            <kbd>Shift</kbd>+click row, <kbd>Ctrl</kbd>/<kbd>&#8984;</kbd>+click toggle
+            <kbd>&uarr;</kbd> <kbd>&darr;</kbd> <kbd>&larr;</kbd> <kbd>&rarr;</kbd> move,
+            <kbd>Home</kbd>/<kbd>End</kbd> row ends,
+            <kbd>Ctrl</kbd>+<kbd>Home</kbd>/<kbd>End</kbd> grid corners,
+            <kbd>PgUp</kbd>/<kbd>PgDn</kbd> page,
+            <kbd>Space</kbd> toggle,
+            <kbd>Ctrl</kbd>+<kbd>A</kbd> select all,
+            <kbd>Esc</kbd> clear.
+            <kbd>Shift</kbd>/<kbd>Ctrl</kbd>+click row to range/toggle.<br>
+            <b>Edit:</b> dblclick or <kbd>F2</kbd>/<kbd>Enter</kbd> &middot;
+            <kbd>Enter</kbd> commit+down &middot;
+            <kbd>Tab</kbd> commit+right &middot;
+            <kbd>Esc</kbd> cancel.
         </div>
     </div>
 </aside>
@@ -376,14 +422,21 @@
     <span class="stat">Visible: <b id="stat-vis-start">0</b>&ndash;<b id="stat-vis-end">0</b></span>
     <span class="stat">Focus: <b id="stat-focus">none</b></span>
     <span class="stat">Selected: <b id="stat-selcount">0</b></span>
+    <span class="stat">Edits: <b id="stat-edits">0</b></span>
 </footer>
 
+<!--
+    Importmap pinned to exact published versions so this demo is fully
+    self-contained: open it from anywhere (any static server) and QA/review
+    can run it without a node_modules install. Update the lite-table version
+    after publish.
+-->
 <script type="importmap">
 {
   "imports": {
-    "@zakkster/lite-signal":     "../node_modules/@zakkster/lite-signal/Signal.js",
-    "@zakkster/lite-virtual":    "../node_modules/@zakkster/lite-virtual/Virtual.js",
-    "@zakkster/lite-signal-dom": "../node_modules/@zakkster/lite-signal-dom/SignalDom.js",
+    "@zakkster/lite-signal":     "https://cdn.jsdelivr.net/npm/@zakkster/lite-signal@1.2.1/Signal.js",
+    "@zakkster/lite-virtual":    "https://cdn.jsdelivr.net/npm/@zakkster/lite-virtual@1.1.0/Virtual.js",
+    "@zakkster/lite-signal-dom": "https://cdn.jsdelivr.net/npm/@zakkster/lite-signal-dom@1.0.1/SignalDom.js",
     "@zakkster/lite-table":      "../Table.js"
   }
 }
@@ -418,25 +471,79 @@
     }
     const baseData = Array.from({ length: N0 }, (_, i) => makeRow(i));
     const rows = signal(baseData);
+    const editCount = signal(0);
 
     // ---- Table ----
     // `flex: 1` on Name and Email lets those columns absorb the leftover
     // horizontal space on wide viewports. The fixed-width columns (ID,
-    // Value, Status, Created) stay at their declared sizes. This matches
-    // typical data-grid expectations: identity / status columns are exact,
-    // free-form text columns grow to fill.
+    // Value, Status, Created) stay at their declared sizes.
+    //
+    // M2 opt-ins (per column):
+    //   editable: true   -- double-click / F2 starts cell edit
+    //   filterable: true -- exposes a filter input in the filter row
+    //   filter: (v,q)=>  -- custom filter predicate (default is substring)
     const COLS = [
         { key: "id",        header: "ID",      width: 90,  minWidth: 60 },
-        { key: "name",      header: "Name",    width: 180, minWidth: 120, flex: 1 },
-        { key: "email",     header: "Email",   width: 240, minWidth: 180, flex: 2 },
-        { key: "value",     header: "Value",   width: 100, compare: (a, b) => a - b },
-        { key: "status",    header: "Status",  width: 110 },
-        { key: "createdAt", header: "Created", width: 130 }
+        { key: "name",      header: "Name",    width: 180, minWidth: 120, flex: 1,
+          editable: true, filterable: true },
+        { key: "email",     header: "Email",   width: 240, minWidth: 180, flex: 2,
+          editable: true, filterable: true },
+        { key: "value",     header: "Value",   width: 100, compare: (a, b) => a - b,
+          editable: true, filterable: true,
+          // Custom filter: ">N" / "<N" / exact number / substring fallback.
+          filter: (v, q) => {
+              const t = q.trim();
+              if (!t) return true;
+              if (t.startsWith(">")) {
+                  const n = Number(t.slice(1));
+                  return Number.isFinite(n) && v > n;
+              }
+              if (t.startsWith("<")) {
+                  const n = Number(t.slice(1));
+                  return Number.isFinite(n) && v < n;
+              }
+              const n = Number(t);
+              if (Number.isFinite(n)) return v === n;
+              return String(v).indexOf(t) >= 0;
+          },
+          filterPlaceholder: ">500 / <100 / 42" },
+        { key: "status",    header: "Status",  width: 110,
+          editable: true, filterable: true },
+        { key: "createdAt", header: "Created", width: 130,
+          editable: true, filterable: true }
     ];
 
     const table = createTable({
         rows, columns: COLS, getRowId: (r) => r.id,
-        rowHeight: 32, overscan: 4
+        rowHeight: 32, overscan: 4,
+
+        // M2: commit hook. lite-table never mutates rows itself -- the
+        // consumer is responsible for the write. The handler receives
+        // oldValue + newValue and is only invoked when they differ.
+        //
+        // Why rows.set(rows.peek().slice()) afterwards: in-place row mutation
+        // is invisible to the signal graph (rows is a Signal<Row[]>; setting
+        // a property on an element doesn't notify). Cloning the array (new
+        // reference) triggers visibleRows recompute, so any cell whose
+        // accessor depends on the edited field repaints. For the edited cell
+        // itself this is technically redundant (the manual bindText effect
+        // re-runs when editingCell clears), but computed columns reading the
+        // mutated field need this nudge.
+        onCellEdit: ({ row, columnKey, newValue }) => {
+            // newValue is always a string (it came from contenteditable).
+            // Coerce to the column's domain type before writing.
+            if (columnKey === "value") {
+                const trimmed = newValue.trim();
+                if (trimmed === "") return;        // reject empty (Number("") is 0)
+                const n = Number(trimmed);
+                if (!Number.isFinite(n)) return;   // reject NaN / Infinity
+                row.value = n;
+            } else {
+                row[columnKey] = newValue;
+            }
+            rows.set(rows.peek().slice());
+            editCount.update((n) => n + 1);
+        }
     });
 
     const mount = mountTable(document.getElementById("host"), table);
@@ -460,12 +567,14 @@
         $("stat-selcount").textContent = n;
         $("stat-sel").textContent = n + " selected";
     });
+    // Combined sort + filter status -- saves a sidebar line vs two separate stats.
     effect(() => {
         const chain = table.sortChain();
-        $("stat-sort").textContent = chain.length === 0
-            ? "none"
-            : chain.map((e) => e.key + " " + e.dir).join(", ");
+        const filters = table.columnFilters().size;
+        const sortStr = chain.length === 0 ? "none" : chain.map((e) => e.key + " " + e.dir).join(", ");
+        $("stat-sort-filter").textContent = "sort: " + sortStr + " \u00b7 filters: " + filters;
     });
+    effect(() => { $("stat-edits").textContent = editCount(); });
 
     // ---- Scroll buttons ----
     $("btn-top").onclick = () => mount.scrollToIndex(0);
@@ -494,21 +603,66 @@
         rows.set(arr);
     };
     $("btn-reset").onclick = () => {
-        rows.set(baseData);
+        // Re-generate from scratch so any in-place edits during the session
+        // are wiped, not just the array shape restored.
+        for (let i = 0; i < baseData.length; i++) baseData[i] = makeRow(i);
+        rows.set(baseData.slice());
         table.clearSelection();
         table.clearSort();
+        table.clearColumnFilters();
+        editCount.set(0);
         for (const c of table.columns) {
             c.hidden.set(false);
             c.pin.set("none");
         }
     };
 
-    // ---- Sort ----
+    // ---- Sort / Filter ----
     $("btn-clear-sort").onclick = () => table.clearSort();
+    $("btn-clear-filters").onclick = () => table.clearColumnFilters();
+    // One-click demo of multi-column sort. We pick `status` as primary
+    // because it has only four distinct values, so the secondary `id desc`
+    // has plenty of ties to break -- the chain effect is immediately
+    // visible (each status group shows IDs counting down inside it). The
+    // natural user instinct is to click ID first, but ID is unique and
+    // produces no ties, so the secondary appears to do nothing. This
+    // button skips that confusion.
+    $("btn-multi-sort-demo").onclick = () => {
+        table.setSort("status", "asc");
+        table.addSort("id", "desc");
+        mount.scrollToIndex(0);
+    };
 
     // ---- Selection ----
     $("btn-select-all").onclick = () => table.selectAll();
     $("btn-clear-sel").onclick = () => table.clearSelection();
+
+    // ---- Export ----
+    function downloadFile(text, filename, mime) {
+        const blob = new Blob([text], { type: mime });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+    $("btn-export-csv").onclick = () => {
+        // "visible" respects the current filter + sort -- exactly what the user sees.
+        const csv = table.exportCsv({ rows: "visible", bom: true });
+        downloadFile(csv, "lite-table-visible.csv", "text/csv;charset=utf-8");
+    };
+    $("btn-export-csv-sel").onclick = () => {
+        // For "Select all" we want the FULL master, not just current page.
+        const csv = table.exportCsv({ rows: table.selectedRows(baseData), bom: true });
+        downloadFile(csv, "lite-table-selected.csv", "text/csv;charset=utf-8");
+    };
+    $("btn-export-json").onclick = () => {
+        const json = table.exportJson({ rows: baseData, columns: "all", indent: 2 });
+        downloadFile(json, "lite-table-all.json", "application/json;charset=utf-8");
+    };
 
     // ---- Column controls (hide / pin) ----
     const colControls = $("col-controls");
@@ -579,6 +733,10 @@
 
     // Focus the grid on load so keyboard works.
     mount.root.focus();
+
+    // Expose for QA / browser tests if anyone wants to poke at the live state.
+    window.__demo = { table, mount, rows, baseData, editCount };
+    window.__demoReady = true;
 </script>
 </body>
 </html>

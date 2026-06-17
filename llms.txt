@@ -130,9 +130,106 @@ TableCore methods (focus):
               rowStart, rowEnd, pageUp, pageDown
   skips hidden columns; follows current sort order
 
+TableCore methods (export, M1.1):
+  exportCsv(opts?) -> string
+    opts.rows: "visible"|"all"|"selected"|Array (default "visible")
+    opts.columns: "visible"|"all"|Array<key> (default "visible")
+    opts.delimiter: string (default ",")
+    opts.quote: string (default '"')
+    opts.headers: boolean (default true)
+    opts.newline: string (default "\r\n")
+    opts.bom: boolean (default false; UTF-8 BOM for Excel-on-Windows)
+    opts.formatter: (row, col) => unknown
+    RFC 4180 escaping; column accessor honored; numbers stringify naturally;
+    null/undefined become empty fields.
+
+  exportJson(opts?) -> string | object[]
+    opts.rows: same as exportCsv
+    opts.columns: same as exportCsv
+    opts.indent: number (default 0 = compact single-line)
+    opts.format: "string"|"array" (default "string"; "array" skips JSON.stringify)
+    opts.formatter: (row, col) => unknown
+    Fast path: columns:"all"+no formatter returns rows.slice() (shallow).
+
+  Paginated-getter pitfall: rows:"all" and rows:"selected" resolve against
+  rowsGetter(), which for a function-form rows IS the current page. To
+  export across the master, pass the master array:
+      table.exportCsv({rows: allRows})
+      table.exportCsv({rows: table.selectedRows(allRows)})
+
+TableCore filtering (M2):
+  Column opt-in: { key, filterable: true,
+                   filter?: (value, query, row) => boolean,
+                   filterPlaceholder?: string }
+
+  Default predicate: case-insensitive substring on stringified value.
+  Empty / whitespace-only query: filter is treated as inactive (predicate
+  not invoked).
+
+  Reactive surface:
+    columnFilters() -> ReadonlyMap<columnKey, queryString>
+    filteredRows()  -> Computed rows post-filter, pre-sort
+    visibleRows()   -> Computed rows post-filter AND post-sort
+
+  Methods:
+    setColumnFilter(key, value)   value=null/""/whitespace clears that column
+    clearColumnFilters()           no-op + no notify if already empty
+
+  Pipeline: rowsGetter -> filteredRows -> visibleRows -> exports/mount
+  Multiple active filters apply as AND.
+
+  DOM (when mounted): a .lt-filter-row is mounted between header + viewport
+  if any column is filterable. One <input> per filterable column, two-way
+  bound. Escape on input clears that column's filter. Sticky top.
+
+TableCore editing (M2):
+  Column opt-in: { key, editable: true }
+  Config: createTable({ ...,
+                        onCellEdit: ({row, columnKey, oldValue, newValue}) => ... })
+
+  lite-table does NOT mutate rows. onCellEdit is the consumer's write hook.
+
+  Reactive surface:
+    editingCell()  -> { rowId, columnKey } | null
+    editingDraft() -> current in-progress string
+
+  Methods:
+    startEdit(rowId, columnKey)    no-op on non-editable; auto-commits
+                                    in-flight on a different cell;
+                                    idempotent on the same cell.
+    commitEdit()                   reads editingDraft
+    commitEdit("explicit")         commits a specific value
+    cancelEdit()                   discard; no onCellEdit
+    isEditing(rowId, columnKey)    O(1) predicate
+
+  Commit-skip: onCellEdit is NOT called when the value is unchanged.
+    DOM edits produce string newValue; guard compares
+    String(oldValue) !== newValue (so 100 vs "100" is unchanged).
+    Explicit commitEdit(explicitValue) falls back to strict ===.
+    newValue is ALWAYS a string from the DOM path -- consumers
+    coerce in their handler (Number(newValue) / new Date(newValue) /
+    newValue === "true" / etc.).
+  Handler errors are caught + logged; subsequent edits work.
+
+  DOM keyboard (when mounted):
+    dblclick on editable cell -> startEdit
+    F2 / Enter on focused cell with editable column -> startEdit
+    Enter   -> commit + moveFocus down
+    Tab     -> commit + moveFocus right (Shift+Tab = left)
+    Escape  -> cancel + return focus to root
+    blur    -> commit
+
+  Edit state survives scroll: keyed on rowId, so contenteditable rebinds
+  when the row scrolls back into view. Draft preserved across scroll.
+
 TableCore lifecycle:
   dispose()                             releases all reactive nodes
   cellId(rowId, columnKey)              -> "lt_<rowId>__<columnKey>"
+
+  Note: v1.1.0 fixed a latent leak in dispose() (handles were called,
+  not freed). After dispose() every reactive node the table allocated
+  returns to the registry pool. 50 createTable+dispose cycles round-trip
+  cleanly with activeNodes flat.
 
 ### mountTable(host, table, options?) -> TableMount
 
@@ -163,15 +260,28 @@ Header:  <div class="lt-header" role="row" aria-rowindex="1">
              <span class="lt-header-resize"></span>  <!-- if resizable -->
            </div> ...
          </div>
+Filters (M2; mounted only when any column has filterable: true):
+         <div class="lt-filter-row" role="row" aria-rowindex="2">
+           <div class="lt-filter-cell" data-key data-pin
+                style="grid-column; left|right (if pinned)">
+             <input class="lt-filter-input"
+                    aria-label="Filter <header>"
+                    placeholder="Filter…">
+             <!-- empty cells for non-filterable columns -->
+           </div> ...
+         </div>
 Body:    <div class="lt-viewport"><div class="lt-inner">
            <div class="lt-row [lt-row-alt] [is-selected]"
                 role="row"
                 aria-rowindex aria-selected
                 style="transform: translateY(<i*rowHeight>px)">
-             <div class="lt-cell" role="gridcell"
+             <div class="lt-cell [is-focused] [is-editing]"
+                  role="gridcell"
                   id="lt_<rowId>__<columnKey>"
                   aria-colindex
                   data-pin
+                  [data-editable="true"]
+                  [contenteditable="true"]   <!-- only the active edit cell -->
                   style="grid-column; left|right (if pinned)">text</div>
              ...
            </div> ...
@@ -185,13 +295,22 @@ Ctrl+Home/End              grid corners (0,0) / (last,last)
 PageUp/PageDown            +/- floor(viewportHeight / rowHeight)
 Space                      selectRow(focused.rowId, "set")
 Ctrl+A                     selectAll()
-Escape                     clearSelection()
+Escape                     clearSelection() (when not editing)
+F2 / Enter (on editable)   startEdit(focused) (M2)
+Dblclick on editable cell  startEdit (M2)
 Click cell                 selectRow(set) + focus
 Shift+click                selectRow(range)
 Ctrl/Cmd+click             selectRow(toggle)
 Drag header                reorder
 Drag right edge of header  resize
 Click header               toggleSort
+(while editing):
+  Enter                    commitEdit + moveFocus("down")
+  Tab / Shift+Tab          commitEdit + moveFocus("right"/"left")
+  Escape                   cancelEdit + return focus to root
+  blur                     commitEdit
+(on a filter input):
+  Escape                   setColumnFilter(key, "")
 Shift+click header         toggleSort additive
 
 ## Performance

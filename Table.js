@@ -90,49 +90,80 @@ function defaultCompare(a, b) {
 }
 
 /**
- * Create a disposable scope. Tracks effects, listeners, signals, computeds,
- * and arbitrary cleanups. `dispose()` runs everything in reverse order, once.
+ * Create a disposable scope. Tracks signals, computeds, effects, event
+ * listeners, and arbitrary user cleanups. `dispose()` runs them in reverse
+ * order, once.
+ *
+ * Implementation note: lite-signal returns CALLABLE handles for signals and
+ * computeds. To free them we must call the lite-signal `dispose()` (imported
+ * here as `disposeNode`) on the handle -- calling the handle as a function
+ * just reads it. Effect disposers are themselves the cleanup function; event
+ * remover thunks and user onCleanup callbacks are likewise just called.
+ *
+ * Cleanups are recorded as discriminated entries so the dispose loop knows
+ * which path to take per entry. The previous (v1.0.0) implementation pushed
+ * raw signal handles and tried to call them on cleanup -- which silently
+ * read them instead of disposing, leaving the nodes pinned in the lite-signal
+ * registry across createTable -> dispose() cycles (a real leak; visible only
+ * when many tables are created in one process, e.g. tests).
  */
 function createScope() {
-    const cleanups = [];
+    const KIND_NODE = 1;        // lite-signal handle (signal or computed)
+    const KIND_THUNK = 2;       // plain function: effect disposer, remover, user cleanup
+    // Two parallel arrays keep the per-entry shape allocation-free; one
+    // slot per cleanup is two integers' worth of memory, no per-entry obj.
+    const cleanupKinds = [];
+    const cleanupTargets = [];
     let disposed = false;
+
+    function pushNode(handle) {
+        cleanupKinds.push(KIND_NODE);
+        cleanupTargets.push(handle);
+    }
+    function pushThunk(fn) {
+        cleanupKinds.push(KIND_THUNK);
+        cleanupTargets.push(fn);
+    }
+
     const scope = {
         signal(initial, opts) {
             const s = signal(initial, opts);
-            cleanups.push(s);
+            pushNode(s);
             return s;
         },
         computed(fn, opts) {
             const c = computed(fn, opts);
-            cleanups.push(c);
+            pushNode(c);
             return c;
         },
         effect(fn) {
             const d = effect(fn);
-            cleanups.push(d);
+            pushThunk(d);
             return d;
         },
         on(el, type, handler, opts) {
             el.addEventListener(type, handler, opts);
             const off = () => el.removeEventListener(type, handler, opts);
-            cleanups.push(off);
+            pushThunk(off);
             return off;
         },
         onCleanup(fn) {
-            cleanups.push(fn);
+            pushThunk(fn);
         }
     };
     function dispose() {
         if (disposed) return;
         disposed = true;
-        for (let i = cleanups.length - 1; i >= 0; i--) {
-            const c = cleanups[i];
+        for (let i = cleanupKinds.length - 1; i >= 0; i--) {
+            const k = cleanupKinds[i];
+            const t = cleanupTargets[i];
             try {
-                if (typeof c === "function") c();
-                else disposeNode(c);
+                if (k === KIND_NODE) disposeNode(t);
+                else t();
             } catch (_e) { /* per-handler */ }
         }
-        cleanups.length = 0;
+        cleanupKinds.length = 0;
+        cleanupTargets.length = 0;
     }
     return { scope, dispose };
 }
@@ -169,6 +200,19 @@ function createColumnState(def, scope, defaults) {
         pinnable: def.pinnable !== false,
         hideable: def.hideable !== false,
         reorderable: def.reorderable !== false,
+        // M2: cell editing opt-in. False by default; columns that drive
+        // computed values (accessor with no underlying field) should stay
+        // false because there's nowhere to write back to.
+        editable: def.editable === true,
+        // M2: per-column filter opt-in. False by default.
+        filterable: def.filterable === true,
+        // M2: optional custom filter predicate. (value, query, row) => boolean.
+        // value is the column's value (accessor-resolved). query is the trimmed
+        // current filter string. row is the full row (handy for cross-field
+        // filters or when the consumer wants more than the cell value).
+        // Default: case-insensitive substring match on the stringified value.
+        filter: typeof def.filter === "function" ? def.filter : null,
+        filterPlaceholder: typeof def.filterPlaceholder === "string" ? def.filterPlaceholder : null,
         minWidth,
         maxWidth,
         width,
@@ -244,7 +288,11 @@ export function createTable(config) {
         rowHeight = 32,
         overscan = 4,
         initialFocus = null,
-        initialSort = []
+        initialSort = [],
+        // M2: cell-edit hook. Fires on commit with the row + column key +
+        // new + old value. Consumer mutates their row data (or stores the
+        // change in a backend); the table itself does NOT mutate rows.
+        onCellEdit = null
     } = config;
 
     if (typeof getRowId !== "function") {
@@ -391,9 +439,59 @@ export function createTable(config) {
         return m;
     });
 
+    // --- Filters (M2) ---
+    // Reactive Map<columnKey, string>. We use a Map so we can clear and add
+    // without re-allocating an object literal per change, but we wrap mutations
+    // in a fresh-Map .set() call (Object.is inequality is what notifies
+    // downstream computeds; mutating in place would silently skip propagation).
+    const columnFilters = scope.signal(new Map());
+
+    function _filterMatchesAll(row) {
+        const filters = columnFilters();
+        if (filters.size === 0) return true;
+        for (const [key, raw] of filters) {
+            const q = typeof raw === "string" ? raw.trim() : "";
+            if (q.length === 0) continue;
+            const col = columnsByKey.get(key);
+            if (!col || !col.filterable) continue;
+            const v = readCell(col, row);
+            const pred = col.filter;
+            if (pred) {
+                if (!pred(v, q, row)) return false;
+            } else {
+                // Default: case-insensitive substring on stringified value.
+                // null/undefined become empty -- they fail any non-empty filter.
+                const s = (v === null || v === undefined) ? "" : String(v);
+                if (s.toLowerCase().indexOf(q.toLowerCase()) < 0) return false;
+            }
+        }
+        return true;
+    }
+
+    // Reactive: filtered source. visibleRows now sorts THIS, not raw rowsGetter.
+    // When no filter is active, returns the source array as-is (identity) to
+    // avoid an unnecessary O(N) allocation. When any filter has a non-empty
+    // query, walks the source once and produces a fresh filtered array.
+    const filteredRows = scope.computed(() => {
+        const src = rowsGetter();
+        const filters = columnFilters();
+        // Fast path: no filters at all OR every filter is empty.
+        if (filters.size === 0) return src;
+        let hasActive = false;
+        for (const v of filters.values()) {
+            if (typeof v === "string" && v.trim().length > 0) { hasActive = true; break; }
+        }
+        if (!hasActive) return src;
+        const out = [];
+        for (let i = 0; i < src.length; i++) {
+            if (_filterMatchesAll(src[i])) out.push(src[i]);
+        }
+        return out;
+    });
+
     // --- Sort ---
     // Sort chain: list of {key, dir}. visibleRows applies it as a stable
-    // multi-key sort to the source rows.
+    // multi-key sort to the filtered source.
     const sortChain = scope.signal(
         Array.isArray(initialSort)
             ? initialSort.filter((s) => s && columnsByKey.has(s.key))
@@ -408,7 +506,7 @@ export function createTable(config) {
     let _sortIdxBuf = null;
 
     const visibleRows = scope.computed(() => {
-        const src = rowsGetter();
+        const src = filteredRows();
         const chain = sortChain();
         if (!chain.length) return src;
         const n = src.length;
@@ -452,22 +550,50 @@ export function createTable(config) {
         const chain = sortChain();
         const additive = opts && opts.additive === true;
         const existing = chain.findIndex((e) => e.key === key);
-        // Cycle: none -> asc -> desc -> none.
-        const nextDir = existing < 0
-            ? "asc"
-            : chain[existing].dir === "asc" ? "desc" : null;
+
         if (additive) {
+            // Shift-click: 3-state cycle per chain entry.
+            //   not in chain  -> append at asc
+            //   in chain asc  -> flip to desc
+            //   in chain desc -> remove from chain
+            // This is how chain membership is MANAGED -- it can both grow
+            // and shrink the chain.
             const next = chain.slice();
             if (existing < 0) {
-                next.push({ key, dir: nextDir });
-            } else if (nextDir == null) {
-                next.splice(existing, 1);
+                next.push({ key, dir: "asc" });
+            } else if (chain[existing].dir === "asc") {
+                next[existing] = { key, dir: "desc" };
             } else {
-                next[existing] = { key, dir: nextDir };
+                next.splice(existing, 1);
             }
             sortChain.set(next);
+            return;
+        }
+
+        // Plain click: drives the PRIMARY sort, never silently dismantles a
+        // user-built multi-column chain.
+        if (existing < 0) {
+            // Column not in chain: replace whole chain with single-col asc.
+            // Lets the user re-anchor primary sort with one click.
+            sortChain.set([{ key, dir: "asc" }]);
+        } else if (chain.length === 1) {
+            // Sole entry: legacy 3-state cycle (asc -> desc -> cleared).
+            // Some users rely on a third plain click to fully unsort.
+            sortChain.set(chain[0].dir === "asc"
+                ? [{ key, dir: "desc" }]
+                : []);
         } else {
-            sortChain.set(nextDir == null ? [] : [{ key, dir: nextDir }]);
+            // Column is already part of a MULTI-column chain: toggle just
+            // that entry's direction (asc <-> desc). No removal -- the user
+            // built this chain on purpose; one stray plain-click should not
+            // tear it down. Removal is intentional via shift-click (cycle to
+            // remove) or `clearSort()`.
+            const next = chain.slice();
+            next[existing] = {
+                key,
+                dir: chain[existing].dir === "asc" ? "desc" : "asc"
+            };
+            sortChain.set(next);
         }
     }
 
@@ -762,6 +888,309 @@ export function createTable(config) {
         columnOrder.set(order);
     }
 
+    // --- Filters (M2 mutators) ---
+    function setColumnFilter(key, value) {
+        const col = columnsByKey.get(key);
+        if (!col || !col.filterable) return;
+        const next = new Map(columnFilters());
+        if (value === null || value === undefined || value === "") {
+            next.delete(key);
+        } else {
+            next.set(key, String(value));
+        }
+        columnFilters.set(next);
+    }
+    function clearColumnFilters() {
+        if (columnFilters().size === 0) return;
+        columnFilters.set(new Map());
+    }
+
+    // --- Cell editing (M2) ---
+    // editingCell points at the (rowId, columnKey) currently being edited,
+    // or null. Like focusedCell, editing is keyed on row identity so it
+    // survives scroll, sort, filter, slot recycling -- a cell that scrolls
+    // out of the viewport stays "editing" if it scrolls back in.
+    const editingCell = scope.signal(null);
+    // editingDraft is the in-progress value being typed. mountTable writes to
+    // it from `input` events on the contenteditable cell; the consumer rarely
+    // needs to read this directly (commitEdit captures it for them).
+    const editingDraft = scope.signal("");
+
+    function isEditing(rowId, columnKey) {
+        const e = editingCell();
+        if (e === null) return false;
+        return e.rowId === rowId && e.columnKey === columnKey;
+    }
+
+    function startEdit(rowId, columnKey) {
+        const col = columnsByKey.get(columnKey);
+        if (!col || !col.editable) return;
+        // Already editing this exact cell -- no-op so an idempotent double-
+        // click or programmatic call doesn't clobber the in-flight draft.
+        const e = editingCell();
+        if (e !== null && e.rowId === rowId && e.columnKey === columnKey) return;
+        // Editing a different cell -- commit before switching so the user's
+        // typed-in value isn't silently dropped on a tab-out / click-elsewhere.
+        if (e !== null) {
+            commitEdit();
+        }
+        // Seed the draft with the current cell value so the consumer's
+        // onCellEdit gets a clean oldValue/newValue diff even if they don't
+        // touch anything.
+        const row = _findRowById(rowId);
+        if (row !== undefined) {
+            const v = readCell(col, row);
+            editingDraft.set(v === null || v === undefined ? "" : String(v));
+        } else {
+            editingDraft.set("");
+        }
+        editingCell.set({ rowId, columnKey });
+    }
+
+    function commitEdit(explicitValue) {
+        const e = editingCell();
+        if (e === null) return;
+        const col = columnsByKey.get(e.columnKey);
+        const row = _findRowById(e.rowId);
+        const newValue = arguments.length > 0 ? explicitValue : editingDraft();
+        editingCell.set(null);
+        editingDraft.set("");
+        if (col && row !== undefined && onCellEdit) {
+            const oldValue = readCell(col, row);
+
+            // No-op guard: skip the hook when nothing actually changed.
+            // If newValue is a string (from contenteditable), coerce oldValue
+            // to a string to prevent false positives (e.g., 100 !== "100").
+            // If a non-string is explicitly passed, use standard strict equality.
+            const isChanged = typeof newValue === "string"
+                ? String(oldValue) !== newValue
+                : oldValue !== newValue;
+
+            if (isChanged) {
+                try {
+                    onCellEdit({
+                        row,
+                        columnKey: e.columnKey,
+                        oldValue,
+                        newValue,
+                    });
+                } catch (err) {
+                    try { console.error("lite-table: onCellEdit threw:", err); } catch (_) {}
+                }
+            }
+        }
+    }
+
+    function cancelEdit() {
+        if (editingCell() === null) return;
+        editingCell.set(null);
+        editingDraft.set("");
+    }
+
+    // Best-effort row lookup by id. Walks the master once -- O(N). The cell-
+    // editing happy path uses this once per commit, not per keystroke, so the
+    // linear scan is fine; if a consumer with millions of rows wants O(1)
+    // they can build their own id->row index and pass it in via onCellEdit
+    // by other means (or use selectedRows-style materializers).
+    function _findRowById(rowId) {
+        const src = rowsGetter();
+        for (let i = 0; i < src.length; i++) {
+            if (getRowId(src[i]) === rowId) return src[i];
+        }
+        return undefined;
+    }
+
+    // --- Export ---
+    // Resolve the row source for an export call:
+    //   rows: "visible"   => visibleRows() (post-sort/filter, post-pagination if you reactify it)
+    //   rows: "selected"  => current selection materialized against the chosen source
+    //   rows: "all"       => rowsGetter() (the original master)
+    //   rows: <array>     => an explicit array (e.g. a snapshot)
+    // Selection mode interacts naturally: passing rows: "selected" with
+    // selectAll() active exports every row minus the blacklist, which is
+    // typically what the user means when they Ctrl+A then "Export selected".
+    function _resolveRows(rowsOpt) {
+        if (Array.isArray(rowsOpt)) return rowsOpt;
+        if (rowsOpt === "all") return rowsGetter();
+        if (rowsOpt === "selected") return selectedRows(rowsGetter());
+        // default "visible"
+        return visibleRows();
+    }
+
+    // Resolve column list. "visible" honors hidden + order; "all" walks
+    // declared columns in declaration order regardless of hide/order state.
+    // Array of keys = explicit projection.
+    function _resolveColumns(colsOpt) {
+        if (Array.isArray(colsOpt)) {
+            const out = [];
+            for (const k of colsOpt) {
+                const c = columnsByKey.get(k);
+                if (c) out.push(c);
+            }
+            return out;
+        }
+        if (colsOpt === "all") return columns.slice();
+        // default "visible"
+        return visibleColumns();
+    }
+
+    // Extract the displayed value for a cell: accessor() if present, else
+    // row[key]. Used by both exports + a documented helper if you ever
+    // want the same projection elsewhere (currently inlined for speed).
+    function _cellValue(row, col) {
+        return col.accessor ? col.accessor(row) : row[col.key];
+    }
+
+    // CSV escape rule (RFC 4180): if a field contains the delimiter, a
+    // quote, CR, or LF, it must be enclosed in quotes and any inner quote
+    // doubled. We additionally accept a custom delimiter + quote char.
+    function _csvEscape(value, delimiter, quote) {
+        if (value === null || value === undefined) return "";
+        const s = typeof value === "string" ? value : String(value);
+        if (s.length === 0) return "";
+        // The quote-doubling is a regex with the configured quote char.
+        // Build the matcher lazily; for the default '"' delimiter ',' this
+        // is the same hot path every call, so V8 caches the regex behind
+        // the literal anyway.
+        const needsQuote =
+            s.indexOf(delimiter) !== -1 ||
+            s.indexOf(quote) !== -1 ||
+            s.indexOf("\n") !== -1 ||
+            s.indexOf("\r") !== -1;
+        if (!needsQuote) return s;
+        // Double any embedded quote
+        let escaped = "";
+        for (let i = 0; i < s.length; i++) {
+            const ch = s[i];
+            escaped += ch === quote ? quote + quote : ch;
+        }
+        return quote + escaped + quote;
+    }
+
+    /**
+     * Export rows to a CSV string.
+     *
+     * @param {object} [opts]
+     * @param {"visible"|"all"|"selected"|Array} [opts.rows="visible"]
+     *        Which rows to export.
+     * @param {"visible"|"all"|Array<string>} [opts.columns="visible"]
+     *        Which columns to project. Array values are column keys.
+     * @param {string} [opts.delimiter=","]
+     *        Field separator. Common alternatives: "\t" for TSV, ";" for
+     *        regional CSV.
+     * @param {string} [opts.quote='"']
+     *        Quote character (per RFC 4180).
+     * @param {boolean} [opts.headers=true]
+     *        Emit a header row.
+     * @param {string} [opts.newline="\r\n"]
+     *        Line separator. RFC 4180 says CRLF; LF works fine for most
+     *        consumers and tends to be what spreadsheet imports prefer
+     *        when opened on macOS / Linux.
+     * @param {boolean} [opts.bom=false]
+     *        Prepend a UTF-8 BOM. Excel on Windows uses this to detect
+     *        UTF-8 encoding for non-ASCII content.
+     * @param {(row:any, col:ColumnState) => unknown} [opts.formatter]
+     *        Optional cell formatter run BEFORE the value is stringified
+     *        and CSV-escaped. Receives the raw row + the column state.
+     *        Use this for date formatting, number locales, etc.
+     * @returns {string}
+     */
+    function exportCsv(opts) {
+        opts = opts || {};
+        const rows = _resolveRows(opts.rows);
+        const cols = _resolveColumns(opts.columns);
+        const delimiter = typeof opts.delimiter === "string" && opts.delimiter.length > 0 ? opts.delimiter : ",";
+        const quote = typeof opts.quote === "string" && opts.quote.length > 0 ? opts.quote : '"';
+        const headers = opts.headers !== false;
+        const newline = typeof opts.newline === "string" ? opts.newline : "\r\n";
+        const bom = opts.bom === true;
+        const fmt = typeof opts.formatter === "function" ? opts.formatter : null;
+
+        // Pre-size for one pass append; the final string is built by Array.join
+        // to avoid the O(N^2) string concat trap.
+        const lines = [];
+        if (headers) {
+            const head = new Array(cols.length);
+            for (let i = 0; i < cols.length; i++) {
+                head[i] = _csvEscape(cols[i].header, delimiter, quote);
+            }
+            lines.push(head.join(delimiter));
+        }
+        for (let r = 0; r < rows.length; r++) {
+            const row = rows[r];
+            const cells = new Array(cols.length);
+            for (let c = 0; c < cols.length; c++) {
+                const col = cols[c];
+                const raw = fmt ? fmt(row, col) : _cellValue(row, col);
+                cells[c] = _csvEscape(raw, delimiter, quote);
+            }
+            lines.push(cells.join(delimiter));
+        }
+        const body = lines.join(newline);
+        return bom ? "\uFEFF" + body : body;
+    }
+
+    /**
+     * Export rows to a JSON string (or array, if `format: "array"`).
+     *
+     * @param {object} [opts]
+     * @param {"visible"|"all"|"selected"|Array} [opts.rows="visible"]
+     * @param {"visible"|"all"|Array<string>} [opts.columns="visible"]
+     *        When provided, output objects contain only the projected keys.
+     *        With "all" + no formatter, this is just `rows` unchanged
+     *        (the raw row objects), so we avoid an unnecessary allocation.
+     * @param {number} [opts.indent=0]
+     *        JSON.stringify indent. 0 = compact (single line).
+     * @param {"string"|"array"} [opts.format="string"]
+     *        "string" (default) returns the serialized JSON text.
+     *        "array" returns the projected array directly (skips
+     *        JSON.stringify). Useful for chaining into IndexedDB,
+     *        postMessage, structured clone, or further transforms.
+     * @param {(row:any, col:ColumnState) => unknown} [opts.formatter]
+     *        Optional cell formatter, same shape as exportCsv.
+     * @returns {string|Array<object>}
+     */
+    function exportJson(opts) {
+        opts = opts || {};
+        const rows = _resolveRows(opts.rows);
+        const colsOpt = opts.columns;
+        const fmt = typeof opts.formatter === "function" ? opts.formatter : null;
+        const indent = typeof opts.indent === "number" && opts.indent > 0 ? opts.indent : 0;
+        const asArray = opts.format === "array";
+
+        let out;
+
+        // Fast path: when the consumer wants the raw row objects (no column
+        // projection, no formatter) we can return the array as-is for
+        // format:"array" or stringify it directly for format:"string".
+        if (colsOpt === undefined && !fmt) {
+            // Default behaviour: project to visible columns (matches CSV
+            // default). If you really want the raw rows, pass columns: "all".
+            // We still go through the projection path below.
+        }
+
+        if (colsOpt === "all" && !fmt) {
+            // Raw rows -- safe because we don't mutate, the consumer owns
+            // the lifetime of the strings.
+            out = rows.slice();
+        } else {
+            const cols = _resolveColumns(colsOpt);
+            out = new Array(rows.length);
+            for (let r = 0; r < rows.length; r++) {
+                const row = rows[r];
+                const obj = {};
+                for (let c = 0; c < cols.length; c++) {
+                    const col = cols[c];
+                    obj[col.key] = fmt ? fmt(row, col) : _cellValue(row, col);
+                }
+                out[r] = obj;
+            }
+        }
+
+        if (asArray) return out;
+        return indent > 0 ? JSON.stringify(out, null, indent) : JSON.stringify(out);
+    }
+
     return {
         // Static
         columns,
@@ -772,6 +1201,7 @@ export function createTable(config) {
 
         // Reactive: data
         rowsGetter,
+        filteredRows,
         visibleRows,
         rowCount,
 
@@ -785,14 +1215,17 @@ export function createTable(config) {
         leftOffsets,
         rightOffsets,
 
-        // Reactive: sort
+        // Reactive: sort / filters
         sortChain,
+        columnFilters,
 
-        // Reactive: focus / selection
+        // Reactive: focus / selection / editing
         focusedCell,
         selection,
         selectionAnchor,
         selectedCount,
+        editingCell,
+        editingDraft,
 
         // Methods: sort
         setSort, addSort, toggleSort, clearSort,
@@ -804,6 +1237,15 @@ export function createTable(config) {
         // Methods: columns
         setColumnWidth, setColumnHidden, setColumnPin, setColumnFlex,
         setColumnOrder, moveColumn,
+
+        // Methods: filters
+        setColumnFilter, clearColumnFilters,
+
+        // Methods: editing
+        startEdit, commitEdit, cancelEdit, isEditing,
+
+        // Methods: export
+        exportCsv, exportJson,
 
         // Methods: focus
         moveFocus,
@@ -913,7 +1355,26 @@ const DEFAULT_STYLES =
     // cell to a new stacking context (which box-shadow + position:relative
     // could do, causing pixel-shift during compositor layer creation), and
     // doesn't conflict with sticky positioning on pinned cells.
-    ".lt-cell.is-focused{outline:2px solid #3b82f6;outline-offset:-2px}";
+    ".lt-cell.is-focused{outline:2px solid #3b82f6;outline-offset:-2px}" +
+    // M2: editable cell affordance (subtle cursor hint on hover) + active
+    // editing state (filled background + caret-line outline).
+    ".lt-cell[data-editable=\"true\"]{cursor:text}" +
+    ".lt-cell.is-editing{outline:2px solid #f59e0b;outline-offset:-2px;" +
+    "background:#fff;overflow:visible;white-space:normal;" +
+    "text-overflow:clip}" +
+    // M2: filter row sits between header and viewport, mirrors --lt-cols.
+    ".lt-filter-row{position:sticky;top:32px;z-index:4;display:grid;" +
+    "grid-template-columns:var(--lt-cols);background:#f1f5f9;" +
+    "border-bottom:1px solid #e2e8f0;width:max-content;min-width:100%;" +
+    "grid-auto-flow:column;grid-template-rows:auto}" +
+    ".lt-filter-cell{padding:4px 6px;box-sizing:border-box;" +
+    "border-right:1px solid #f1f5f9;grid-row:1;background:inherit}" +
+    ".lt-filter-cell[data-pin=\"left\"]{position:sticky;z-index:5;background:#f1f5f9}" +
+    ".lt-filter-cell[data-pin=\"right\"]{position:sticky;z-index:5;background:#f1f5f9}" +
+    ".lt-filter-input{width:100%;padding:3px 6px;font:inherit;font-size:12px;" +
+    "background:#fff;color:#0f172a;border:1px solid #cbd5e1;border-radius:3px;" +
+    "outline:none;box-sizing:border-box}" +
+    ".lt-filter-input:focus{border-color:#3b82f6;box-shadow:0 0 0 2px #dbeafe}";
 
 let _stylesInjected = new WeakSet();
 function injectStyles(doc) {
@@ -991,7 +1452,10 @@ export function mountTable(host, table, options) {
         sortChain, focusedCell, selection,
         getRowId, cellId,
         toggleSort, selectRow, isSelected, moveFocus,
-        setColumnWidth, moveColumn
+        setColumnWidth, moveColumn,
+        // M2 surface
+        columnFilters, setColumnFilter,
+        editingCell, editingDraft, startEdit, commitEdit, cancelEdit
     } = table;
 
     const { scope, dispose: disposeScope } = createScope();
@@ -1051,6 +1515,93 @@ export function mountTable(host, table, options) {
         headerCells.set(col.key, { el: cell, labelEl, sortEl, resizeEl, col });
     }
     root.appendChild(header);
+
+    // ----- Filter row (M2) --------------------------------------------------
+    // Only mounted if at least one declared column has filterable: true.
+    // Sits between the header and the viewport in the DOM, uses the same
+    // CSS Grid template (via --lt-cols inherited from root), and recycles
+    // never -- one input per filterable column, hidden when the column is
+    // hidden.
+    const filterCells = new Map();   // key -> input element
+    const hasAnyFilterable = columns.some((c) => c.filterable);
+    let filterRow = null;
+    if (hasAnyFilterable) {
+        filterRow = doc.createElement("div");
+        filterRow.className = "lt-filter-row";
+        filterRow.setAttribute("role", "row");
+        filterRow.setAttribute("aria-rowindex", "2");
+
+        for (const col of columns) {
+            const cell = doc.createElement("div");
+            cell.className = "lt-filter-cell";
+            cell.setAttribute("data-key", col.key);
+            cell.setAttribute("data-pin", "none");
+
+            if (col.filterable) {
+                const input = doc.createElement("input");
+                input.type = "text";
+                input.className = "lt-filter-input";
+                input.setAttribute("aria-label", "Filter " + col.header);
+                if (col.filterPlaceholder) input.placeholder = col.filterPlaceholder;
+                else input.placeholder = "Filter…";
+
+                // Two-way binding. Outer source of truth is columnFilters; we
+                // read it on every change and write into the input only if the
+                // values diverged (so user typing doesn't get reset by their
+                // own write echoing back). Likewise we write into the signal
+                // from `input` events only when divergent.
+                scope.effect(() => {
+                    const cur = columnFilters().get(col.key) || "";
+                    if (input.value !== cur) input.value = cur;
+                });
+                scope.on(input, "input", () => {
+                    setColumnFilter(col.key, input.value);
+                });
+                // Escape clears just this column's filter.
+                scope.on(input, "keydown", (ev) => {
+                    if (ev.key === "Escape") {
+                        ev.preventDefault();
+                        setColumnFilter(col.key, "");
+                    }
+                });
+
+                cell.appendChild(input);
+                filterCells.set(col.key, input);
+            }
+
+            // Mirror grid placement, hide, and pin offsets from the column
+            // state -- same logic as header cells. We reuse the column's
+            // reactive placement so a hidden column drops its filter cell
+            // too, and pinned columns keep their filter input sticky.
+            scope.effect(() => {
+                const placement = colPlacement().get(col.key);
+                if (placement == null) {
+                    cell.style.display = "none";
+                } else {
+                    cell.style.display = "";
+                    cell.style.gridColumn = placement + " / span 1";
+                }
+            });
+            scope.effect(() => {
+                const pinSide = col.pin();
+                cell.setAttribute("data-pin", pinSide);
+                if (pinSide === "left") {
+                    cell.style.left = (leftOffsets().get(col.key) || 0) + "px";
+                    cell.style.right = "";
+                } else if (pinSide === "right") {
+                    cell.style.right = (rightOffsets().get(col.key) || 0) + "px";
+                    cell.style.left = "";
+                } else {
+                    cell.style.left = "";
+                    cell.style.right = "";
+                }
+            });
+
+            filterRow.appendChild(cell);
+        }
+
+        root.appendChild(filterRow);
+    }
 
     // Per-header reactive bindings: gridColumn, display, sticky pin, aria-sort.
     for (const col of columns) {
@@ -1254,14 +1805,32 @@ export function mountTable(host, table, options) {
                 }
             });
 
-            // Reactive text.
-            scope.onCleanup(bindText(cellEl, () => {
+            // Reactive text. We use a manual effect (not bindText) so we can
+            // skip the write when this cell is currently being edited -- the
+            // contenteditable cell IS the source of truth while editing, and
+            // any textContent write would clobber the user's caret.
+            scope.effect(() => {
                 const i = slotIndex();
                 const rs = visibleRows();
-                if (i < 0 || i >= rs.length) return "";
-                const v = readCell(col, rs[i]);
-                return v == null ? "" : v;
-            }));
+                if (i < 0 || i >= rs.length) { cellEl.textContent = ""; return; }
+                const row = rs[i];
+                // Editing gate: suspend text writes for the cell currently in
+                // edit mode. The effect still tracks `editingCell` so it
+                // resumes the moment editing ends. Tracking visibleRows + col
+                // here means scrolling-during-edit re-points the slot to a
+                // different row; we commit the in-flight edit in that case
+                // (see slot-row scroll effect below) so the suspended write
+                // resumes with the right row's data.
+                if (col.editable) {
+                    const e = editingCell();
+                    if (e !== null && row != null && e.rowId === getRowId(row) && e.columnKey === col.key) {
+                        return;
+                    }
+                }
+                const v = readCell(col, row);
+                const text = v == null ? "" : String(v);
+                if (cellEl.textContent !== text) cellEl.textContent = text;
+            });
 
             // Reactive id (the aria-activedescendant target).
             scope.onCleanup(bindAttr(cellEl, "id", () => {
@@ -1287,6 +1856,123 @@ export function mountTable(host, table, options) {
                 if (!f) return false;
                 return getRowId(row) === f.rowId && col.key === f.columnKey;
             }));
+
+            // Editable cells: manage contenteditable + the editing-flash class.
+            // We only attach this machinery for columns that opted in -- non-
+            // editable cells stay simple text nodes with no event listeners.
+            if (col.editable) {
+                cellEl.setAttribute("data-editable", "true");
+
+                // Editing state painted as data + class + contenteditable.
+                scope.effect(() => {
+                    const i = slotIndex();
+                    const rs = visibleRows();
+                    if (i < 0 || i >= rs.length) {
+                        cellEl.removeAttribute("contenteditable");
+                        cellEl.classList.remove("is-editing");
+                        return;
+                    }
+                    const row = rs[i];
+                    if (row == null) {
+                        cellEl.removeAttribute("contenteditable");
+                        cellEl.classList.remove("is-editing");
+                        return;
+                    }
+                    const e = editingCell();
+                    const editingThis = e !== null && e.rowId === getRowId(row) && e.columnKey === col.key;
+                    if (editingThis) {
+                        if (cellEl.getAttribute("contenteditable") !== "true") {
+                            cellEl.setAttribute("contenteditable", "true");
+                            // Seed textContent with the draft so what the user
+                            // sees matches what commitEdit will read. Capture
+                            // the draft synchronously to avoid re-running this
+                            // effect on every keystroke (draft changes don't
+                            // need to re-paint anything else).
+                            const seed = editingDraft.peek();
+                            if (cellEl.textContent !== seed) cellEl.textContent = seed;
+                            // Defer focus to the next microtask so any
+                            // synchronous DOM rearrangement (slot recycle,
+                            // resize) doesn't pre-empt the focus call.
+                            queueMicrotask(() => {
+                                if (cellEl.getAttribute("contenteditable") === "true") {
+                                    cellEl.focus();
+                                    // Select all so a tab into the cell starts
+                                    // with the whole value highlighted -- the
+                                    // standard spreadsheet idiom.
+                                    const sel = doc.getSelection ? doc.getSelection() : null;
+                                    if (sel) {
+                                        const range = doc.createRange();
+                                        range.selectNodeContents(cellEl);
+                                        sel.removeAllRanges();
+                                        sel.addRange(range);
+                                    }
+                                }
+                            });
+                        }
+                        cellEl.classList.add("is-editing");
+                    } else {
+                        if (cellEl.hasAttribute("contenteditable")) {
+                            cellEl.removeAttribute("contenteditable");
+                        }
+                        cellEl.classList.remove("is-editing");
+                    }
+                });
+
+                // input event: keep the draft in sync with the visible content
+                // so commitEdit (which reads editingDraft) gets the latest.
+                scope.on(cellEl, "input", () => {
+                    // Only act when this cell is the one being edited. Slot
+                    // recycling could in theory fire input on a stale cell
+                    // (it shouldn't if contenteditable isn't set, but the
+                    // guard is cheap).
+                    if (cellEl.getAttribute("contenteditable") !== "true") return;
+                    editingDraft.set(cellEl.textContent || "");
+                });
+
+                // keydown: Enter commits (and we move down), Escape cancels,
+                // Tab commits (and the browser moves focus).
+                scope.on(cellEl, "keydown", (ev) => {
+                    if (cellEl.getAttribute("contenteditable") !== "true") return;
+                    if (ev.key === "Escape") {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        cancelEdit();
+                        // Restore focus to the root so keyboard nav continues.
+                        root.focus();
+                    } else if (ev.key === "Enter" && !ev.shiftKey) {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        commitEdit();
+                        root.focus();
+                        // Move focus to the row below if there is one.
+                        moveFocus("down");
+                    } else if (ev.key === "Tab") {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        commitEdit();
+                        root.focus();
+                        moveFocus(ev.shiftKey ? "left" : "right");
+                    }
+                });
+
+                // blur: commit. Use focusout so it fires reliably across all
+                // browsers and bubbles through the cell.
+                scope.on(cellEl, "blur", () => {
+                    if (cellEl.getAttribute("contenteditable") !== "true") return;
+                    commitEdit();
+                });
+
+                // dblclick: start editing this cell.
+                scope.on(cellEl, "dblclick", (ev) => {
+                    const i = slotIndex.peek();
+                    const rs = visibleRows.peek();
+                    if (i < 0 || i >= rs.length) return;
+                    const row = rs[i];
+                    if (row == null) return;
+                    ev.preventDefault();
+                    startEdit(getRowId(row), col.key);
+                });
+            }
 
             // No pointerdown listener here -- the root has one delegated
             // listener that uses closest('.lt-cell') + data-key + slot index.
@@ -1426,6 +2112,22 @@ export function mountTable(host, table, options) {
                 if (ctrl) { table.selectAll(); }
                 else handled = false;
                 break;
+            // M2: F2 and Enter (no modifiers) on the focused cell start
+            // editing if the column is editable. Matches the spreadsheet
+            // convention -- F2 universally, Enter as a convenience.
+            case "F2":
+            case "Enter": {
+                if (ev.shiftKey || ctrl) { handled = false; break; }
+                const f = focusedCell.peek();
+                if (!f) { handled = false; break; }
+                const col = columns.find((c) => c.key === f.columnKey);
+                if (col && col.editable) {
+                    startEdit(f.rowId, f.columnKey);
+                } else {
+                    handled = false;
+                }
+                break;
+            }
             default:
                 handled = false;
         }
