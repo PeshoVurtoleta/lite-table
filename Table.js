@@ -213,6 +213,16 @@ function createColumnState(def, scope, defaults) {
         // Default: case-insensitive substring match on the stringified value.
         filter: typeof def.filter === "function" ? def.filter : null,
         filterPlaceholder: typeof def.filterPlaceholder === "string" ? def.filterPlaceholder : null,
+        // M3: aggregate spec for grouped views. One of the built-in strings
+        // "sum" | "avg" | "min" | "max" | "count", or a custom reducer
+        // (rows, col) => any. `null` (default) means "no aggregate" -- the
+        // column is shown blank in group-header + grand-total rows.
+        aggregate: def.aggregate != null ? def.aggregate : null,
+        // M3: display formatter for aggregate values in group-header +
+        // grand-total rows. (value, col, count) => string. Only affects
+        // display -- `entry.aggregates.get(key)` still returns the raw value
+        // so consumers can format it themselves for export etc.
+        aggregateFormat: typeof def.aggregateFormat === "function" ? def.aggregateFormat : null,
         minWidth,
         maxWidth,
         width,
@@ -505,44 +515,9 @@ export function createTable(config) {
     // stability across the multi-key chain regardless of engine.
     let _sortIdxBuf = null;
 
-    const visibleRows = scope.computed(() => {
-        const src = filteredRows();
-        const chain = sortChain();
-        if (!chain.length) return src;
-        const n = src.length;
-
-        if (!_sortIdxBuf || _sortIdxBuf.length < n) {
-            // Grow factor of 2 to amortize reallocation.
-            const cap = Math.max(n, _sortIdxBuf ? _sortIdxBuf.length * 2 : 1024);
-            _sortIdxBuf = new Uint32Array(cap);
-        }
-        const view = _sortIdxBuf.subarray(0, n);
-        for (let i = 0; i < n; i++) view[i] = i;
-
-        view.sort((iA, iB) => {
-            const rowA = src[iA], rowB = src[iB];
-            for (let k = 0; k < chain.length; k++) {
-                const entry = chain[k];
-                const col = columnsByKey.get(entry.key);
-                if (!col) continue;
-                const av = readCell(col, rowA);
-                const bv = readCell(col, rowB);
-                const c = col.compare(av, bv);
-                if (c !== 0) return entry.dir === "desc" ? -c : c;
-            }
-            return iA - iB;
-        });
-
-        // Single output allocation: an array of N row references (not row copies).
-        // Returning a fresh array each time preserves Object.is inequality so
-        // downstream computeds re-evaluate. Reusing this array across calls
-        // would silently break consumers that hold the prior reference.
-        const out = new Array(n);
-        for (let i = 0; i < n; i++) out[i] = src[view[i]];
-        return out;
-    });
-
-    const rowCount = scope.computed(() => visibleRows().length);
+    // (Sort buffer + `_sortedFilteredRows` + `visibleRows` + `rowCount` are
+    // defined inside the M3 grouping block below, since they now interact
+    // with `groupedRows`/`visibleEntries`.)
 
     function toggleSort(key, opts) {
         const col = columnsByKey.get(key);
@@ -616,6 +591,464 @@ export function createTable(config) {
         sortChain.set(chain);
     }
     function clearSort() { sortChain.set([]); }
+
+    // =========================================================================
+    // --- Grouping + aggregation (M3) -----------------------------------------
+    // =========================================================================
+    //
+    // Pipeline slots between filter and sort:
+    //
+    //   rowsGetter -> filteredRows -> [groupedRows -> visibleEntries] -> visibleRows
+    //                                       |            |
+    //                                       |            +-- sticky headers / grand total
+    //                                       +-- sort applies WITHIN each leaf group
+    //
+    // When `groupBy()` is empty the pipeline short-circuits and behaves
+    // identically to 1.1.0 -- `groupedRows` is `null`, `visibleEntries` is
+    // built by wrapping `sortedFilteredRows` in `{type:"data", row}` cheaply,
+    // and `visibleRows` is just those rows without the wrapper. Non-grouping
+    // tables pay nothing beyond one signal read.
+    //
+    // Aggregates are pure folds over a group's data rows. Multi-level groups
+    // recompute aggregates from LEAF rows at every depth rather than rolling
+    // up child aggregates -- this stays correct for non-associative reducers
+    // like median or "distinct count" that don't compose. For deep trees the
+    // constant factor is dominated by the leaf-row walk regardless, so the
+    // simpler implementation is also the faster-per-line one.
+
+    // ---- Group-path serialization ------------------------------------------
+    // Paths are arrays like ["Europe", "Books"]. We serialize with an ASCII
+    // Unit Separator (U+001F) that essentially never appears in user data,
+    // avoiding collisions with values that contain other punctuation. The
+    // signal-side always operates on path arrays; strings are the storage
+    // key for the collapsed-groups Set (Sets can't compare arrays by value).
+    const GROUP_PATH_SEP = "\x1f";
+    // Sentinel bucket key for null/undefined group values. Kept internal so
+    // consumers never see it -- they see the group's `value` as `null`.
+    const GROUP_NULL_KEY = "\x00__lt_null_group__";
+    function _pathStr(pathArr) { return pathArr.join(GROUP_PATH_SEP); }
+
+    // ---- Built-in aggregators ----------------------------------------------
+    // Each takes (rows, col) and returns the folded value. Null/undefined
+    // values are skipped except for `count`, which counts rows regardless.
+    // `avg` / `min` / `max` return `null` for empty groups so consumers can
+    // tell "no data" from "zero".
+    const AGGS = {
+        sum(rows, col) {
+            let s = 0;
+            for (let i = 0; i < rows.length; i++) {
+                const v = readCell(col, rows[i]);
+                if (typeof v === "number" && !isNaN(v)) s += v;
+            }
+            return s;
+        },
+        avg(rows, col) {
+            let s = 0, n = 0;
+            for (let i = 0; i < rows.length; i++) {
+                const v = readCell(col, rows[i]);
+                if (typeof v === "number" && !isNaN(v)) { s += v; n++; }
+            }
+            return n === 0 ? null : s / n;
+        },
+        min(rows, col) {
+            let m = null;
+            for (let i = 0; i < rows.length; i++) {
+                const v = readCell(col, rows[i]);
+                if (v == null) continue;
+                if (m === null || v < m) m = v;
+            }
+            return m;
+        },
+        max(rows, col) {
+            let m = null;
+            for (let i = 0; i < rows.length; i++) {
+                const v = readCell(col, rows[i]);
+                if (v == null) continue;
+                if (m === null || v > m) m = v;
+            }
+            return m;
+        },
+        count(rows /*, col */) { return rows.length; }
+    };
+    function _resolveAggregator(spec) {
+        if (typeof spec === "function") return spec;
+        if (typeof spec === "string" && AGGS[spec]) return AGGS[spec];
+        return null;
+    }
+    // Pre-resolved (columnKey -> aggregator fn) map. Rebuilt lazily on first
+    // read and again if columns changes -- but columns is static after
+    // createTable, so this is a one-shot in practice.
+    let _aggregators = null;
+    function _getAggregators() {
+        if (_aggregators !== null) return _aggregators;
+        _aggregators = new Map();
+        for (const col of columns) {
+            const fn = _resolveAggregator(col.aggregate);
+            if (fn) _aggregators.set(col.key, fn);
+        }
+        return _aggregators;
+    }
+    function _computeAggregates(rows) {
+        const aggs = _getAggregators();
+        const result = new Map();
+        for (const [key, fn] of aggs) {
+            const col = columnsByKey.get(key);
+            if (!col) continue;
+            result.set(key, fn(rows, col));
+        }
+        return result;
+    }
+
+    // ---- Reactive state -----------------------------------------------------
+    // groupBy is a signal so consumers can flip grouping on/off at runtime.
+    // Accepts a string (single level), string[] (multi-level), or null/empty
+    // (no grouping). Normalized to an array of valid column keys internally.
+    function _normalizeGroupBy(v) {
+        const arr = v == null ? [] : (Array.isArray(v) ? v : [v]);
+        // Drop unknown keys silently -- lets consumers persist their groupBy
+        // to localStorage without a crash if a column was removed later.
+        const out = [];
+        for (const k of arr) {
+            if (typeof k === "string" && columnsByKey.has(k)) out.push(k);
+        }
+        return out;
+    }
+    const groupBy = scope.signal(_normalizeGroupBy(config.groupBy));
+
+    // collapsedGroups: Set<pathStr>. Any group whose pathStr is present is
+    // rendered as a header but its subtree (subgroups + data rows) is not
+    // emitted into visibleEntries. Initial set can be supplied as an array
+    // of path arrays via `initialCollapsedGroups`.
+    const collapsedGroups = scope.signal(
+        (() => {
+            const init = config.initialCollapsedGroups;
+            const s = new Set();
+            if (Array.isArray(init)) {
+                for (const p of init) {
+                    if (Array.isArray(p)) s.add(_pathStr(p.map(String)));
+                }
+            }
+            return s;
+        })()
+    );
+
+    // showGrandTotal: static bool. Making it reactive adds a fanout with
+    // near-zero benefit -- if a consumer wants runtime toggling they can
+    // re-mount. Guarded here to avoid accidental truthy configs.
+    const showGrandTotal = config.showGrandTotal === true;
+
+    // ---- Sort helper (used both by ungrouped path and leaf-group sort) -----
+    // Factored out of the ungrouped visibleRows so leaf groups can call it
+    // with their own row subset without allocating a new sort buffer.
+    // Returns a NEW array of row references; the input is not mutated.
+    function _sortRowsWithChain(src, chain) {
+        const n = src.length;
+        if (!chain.length || n < 2) return src.slice();
+        if (!_sortIdxBuf || _sortIdxBuf.length < n) {
+            const cap = Math.max(n, _sortIdxBuf ? _sortIdxBuf.length * 2 : 1024);
+            _sortIdxBuf = new Uint32Array(cap);
+        }
+        const view = _sortIdxBuf.subarray(0, n);
+        for (let i = 0; i < n; i++) view[i] = i;
+        view.sort((iA, iB) => {
+            const rowA = src[iA], rowB = src[iB];
+            for (let k = 0; k < chain.length; k++) {
+                const entry = chain[k];
+                const col = columnsByKey.get(entry.key);
+                if (!col) continue;
+                const av = readCell(col, rowA);
+                const bv = readCell(col, rowB);
+                const c = col.compare(av, bv);
+                if (c !== 0) return entry.dir === "desc" ? -c : c;
+            }
+            return iA - iB;
+        });
+        const out = new Array(n);
+        for (let i = 0; i < n; i++) out[i] = src[view[i]];
+        return out;
+    }
+
+    // ---- Group tree ---------------------------------------------------------
+    // Recursive partition. At each depth, buckets by (accessor-resolved)
+    // column value; group-key ordering is ascending on the raw bucket key.
+    // Null values bucket under GROUP_NULL_KEY and sort last so they're
+    // visually distinct.
+    function _partition(rows, keys, depth, parentPath) {
+        const groupKey = keys[depth];
+        const col = columnsByKey.get(groupKey);
+        // Insertion-order Map -> we later sort keys; using Map keeps values
+        // grouped without a hashmap of arrays.
+        const buckets = new Map();
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            const v = col ? readCell(col, row) : row[groupKey];
+            const bucketKey = v == null ? GROUP_NULL_KEY : v;
+            let bucket = buckets.get(bucketKey);
+            if (!bucket) { bucket = []; buckets.set(bucketKey, bucket); }
+            bucket.push(row);
+        }
+        const sortedKeys = [...buckets.keys()].sort((a, b) => {
+            // Nulls last, regardless of asc/desc semantics.
+            if (a === GROUP_NULL_KEY) return 1;
+            if (b === GROUP_NULL_KEY) return -1;
+            if (a < b) return -1;
+            if (a > b) return 1;
+            return 0;
+        });
+        const nodes = new Array(sortedKeys.length);
+        const isLeaf = depth + 1 >= keys.length;
+        const chain = sortChain();
+        for (let i = 0; i < sortedKeys.length; i++) {
+            const bk = sortedKeys[i];
+            const bucketRows = buckets.get(bk);
+            const path = parentPath.length === 0
+                ? [String(bk === GROUP_NULL_KEY ? "" : bk)]
+                : parentPath.concat([String(bk === GROUP_NULL_KEY ? "" : bk)]);
+            const pathStr = _pathStr(path);
+            const node = {
+                depth,
+                key: groupKey,
+                value: bk === GROUP_NULL_KEY ? null : bk,
+                path,
+                pathStr,
+                count: bucketRows.length,
+                // Aggregates always fold over LEAF rows (this bucket's
+                // recursive descendants when non-leaf, or its own rows when
+                // leaf -- same set at every level for pure aggregators).
+                aggregates: _computeAggregates(bucketRows),
+                subGroups: null,
+                rows: null
+            };
+            if (isLeaf) {
+                node.rows = _sortRowsWithChain(bucketRows, chain);
+            } else {
+                node.subGroups = _partition(bucketRows, keys, depth + 1, path);
+            }
+            nodes[i] = node;
+        }
+        return nodes;
+    }
+
+    // groupedRows: null when no grouping, GroupNode[] when active.
+    const groupedRows = scope.computed(() => {
+        const keys = groupBy();
+        if (keys.length === 0) return null;
+        const src = filteredRows();
+        // Re-read sortChain via the sortChain read inside _partition -> that
+        // makes leaf-group sort reactive. If we called _sortRowsWithChain
+        // here directly we'd need explicit sortChain() first.
+        return _partition(src, keys, 0, []);
+    });
+
+    // ---- Emit tree to a flat entries array ---------------------------------
+    // A depth-first walk that respects the current collapsed-groups Set.
+    // Entries are one of:
+    //   { type: "data",         row }
+    //   { type: "group-header", depth, key, value, path, pathStr, count,
+    //                            aggregates, isCollapsed }
+    //   { type: "grand-total",  aggregates, count }
+    // The mount layer dispatches per-slot rendering on `entry.type`.
+    function _emitTree(nodes, out, collapsed) {
+        for (let i = 0; i < nodes.length; i++) {
+            const node = nodes[i];
+            const isCollapsed = collapsed.has(node.pathStr);
+            out.push({
+                type: "group-header",
+                depth: node.depth,
+                key: node.key,
+                value: node.value,
+                path: node.path,
+                pathStr: node.pathStr,
+                count: node.count,
+                aggregates: node.aggregates,
+                isCollapsed
+            });
+            if (isCollapsed) continue;
+            if (node.subGroups) {
+                _emitTree(node.subGroups, out, collapsed);
+            } else {
+                const rows = node.rows;
+                for (let j = 0; j < rows.length; j++) {
+                    out.push({ type: "data", row: rows[j] });
+                }
+            }
+        }
+    }
+
+    // Ungrouped -> `visibleRows` behavior, exactly like 1.1.0.
+    // Kept as a private computed so the ungrouped fast path doesn't have to
+    // build entries + strip them.
+    const _sortedFilteredRows = scope.computed(() => {
+        const src = filteredRows();
+        const chain = sortChain();
+        if (!chain.length) return src;
+        return _sortRowsWithChain(src, chain);
+    });
+
+    const visibleEntries = scope.computed(() => {
+        const tree = groupedRows();
+        const collapsed = collapsedGroups();
+        let entries;
+        if (tree === null) {
+            // Ungrouped: wrap each sorted-filtered row as a data entry.
+            const rows = _sortedFilteredRows();
+            entries = new Array(rows.length);
+            for (let i = 0; i < rows.length; i++) entries[i] = { type: "data", row: rows[i] };
+        } else {
+            entries = [];
+            _emitTree(tree, entries, collapsed);
+        }
+        if (showGrandTotal) {
+            // Grand-total aggregates ALWAYS fold over filteredRows (the
+            // whole visible-in-consumer's-sense dataset), regardless of
+            // collapse state. Consumers expect the total to be stable when
+            // they collapse a group.
+            const src = filteredRows();
+            entries.push({
+                type: "grand-total",
+                aggregates: _computeAggregates(src),
+                count: src.length
+            });
+        }
+        return entries;
+    });
+
+    // visibleRows: BACKWARDS COMPAT -- always returns just data rows in
+    // current display order. Ungrouped: same array as 1.1.0's visibleRows.
+    // Grouped: data rows extracted from visibleEntries (respects collapse).
+    const visibleRows = scope.computed(() => {
+        // Ungrouped fast path -- skip entries entirely.
+        if (groupBy().length === 0) return _sortedFilteredRows();
+        const entries = visibleEntries();
+        const out = [];
+        for (let i = 0; i < entries.length; i++) {
+            if (entries[i].type === "data") out.push(entries[i].row);
+        }
+        return out;
+    });
+
+    // rowCount: still counts DATA rows (backwards compat). Consumers that
+    // want the total including group headers should read entryCount().
+    const rowCount = scope.computed(() => visibleRows().length);
+    // entryCount: total emitted entries -- drives the virtual axis in the
+    // mount layer so group-header rows take vertical space in the scrolled
+    // content just like data rows do.
+    const entryCount = scope.computed(() => visibleEntries().length);
+
+    // ---- Grouping mutators -------------------------------------------------
+    function setGroupBy(v) {
+        const next = _normalizeGroupBy(v);
+        // Avoid unnecessary signal writes when the effective value is the
+        // same array of keys. Cheap len+scan comparison.
+        const cur = groupBy();
+        if (cur.length === next.length) {
+            let same = true;
+            for (let i = 0; i < cur.length; i++) {
+                if (cur[i] !== next[i]) { same = false; break; }
+            }
+            if (same) return;
+        }
+        groupBy.set(next);
+        // Prune collapsed paths whose top-level key is no longer part of
+        // groupBy -- otherwise stale entries linger in the Set forever.
+        // (We can't reason about deeper paths without walking the tree, and
+        // they're harmless since they'll never match a real path anyway.)
+        if (collapsedGroups().size > 0 && next.length === 0) {
+            collapsedGroups.set(new Set());
+        }
+    }
+    function _mutateCollapse(fn) {
+        const s = collapsedGroups();
+        const next = new Set(s);
+        fn(next);
+        // Only publish a new Set if membership actually changed -- keeps
+        // downstream computeds stable.
+        if (next.size !== s.size) { collapsedGroups.set(next); return; }
+        for (const k of next) { if (!s.has(k)) { collapsedGroups.set(next); return; } }
+    }
+    function collapseGroup(path) {
+        if (!Array.isArray(path)) return;
+        const key = _pathStr(path.map(String));
+        _mutateCollapse((s) => s.add(key));
+    }
+    function expandGroup(path) {
+        if (!Array.isArray(path)) return;
+        const key = _pathStr(path.map(String));
+        _mutateCollapse((s) => s.delete(key));
+    }
+    function toggleGroup(path) {
+        if (!Array.isArray(path)) return;
+        const key = _pathStr(path.map(String));
+        _mutateCollapse((s) => { if (s.has(key)) s.delete(key); else s.add(key); });
+    }
+    function collapseAllGroups() {
+        // Walk the current groupedRows tree and collect every group's pathStr.
+        // Only makes sense when grouping is active.
+        const tree = groupedRows();
+        if (tree === null) return;
+        const s = new Set();
+        (function walk(nodes) {
+            for (const n of nodes) {
+                s.add(n.pathStr);
+                if (n.subGroups) walk(n.subGroups);
+            }
+        })(tree);
+        collapsedGroups.set(s);
+    }
+    function expandAllGroups() { collapsedGroups.set(new Set()); }
+
+    // Convenience: is a path currently collapsed? Fast enough that consumers
+    // can bind it into row-level effects without indirection.
+    function isGroupCollapsed(path) {
+        if (!Array.isArray(path)) return false;
+        return collapsedGroups().has(_pathStr(path.map(String)));
+    }
+
+    // Ancestor lookup for sticky-header rendering: given an entry index
+    // (usually axis.start()), returns the group-header entries that CONTAIN
+    // it -- one per depth level, deepest last. Returns [] for the ungrouped
+    // path or when the target is above the first group header.
+    function groupAncestryAt(entryIndex) {
+        const entries = visibleEntries();
+        if (entryIndex < 0 || entryIndex >= entries.length) return [];
+        const target = entries[entryIndex];
+        // If target is a group-header, its own row is what the mount is
+        // rendering -- ancestors are strictly-shallower headers. If it's a
+        // data row, ancestors are ALL group headers containing it.
+        const maxDepth = target.type === "group-header" ? target.depth : Infinity;
+        const active = [];
+        for (let i = entryIndex; i >= 0; i--) {
+            const e = entries[i];
+            if (e.type === "group-header" && e.depth < maxDepth && active[e.depth] === undefined) {
+                active[e.depth] = e;
+                // Early exit once we've collected every needed level.
+                let complete = true;
+                for (let d = 0; d < maxDepth && d <= e.depth + 8 /* safety */; d++) {
+                    if (active[d] === undefined) { complete = false; break; }
+                }
+                if (complete && maxDepth !== Infinity) break;
+            }
+            if (e.type === "data" && active.length > 0) {
+                // Data rows always come AFTER their headers. If we've filled
+                // every shallower depth we can stop.
+                let complete = true;
+                for (let d = 0; d < active.length; d++) {
+                    if (active[d] === undefined) { complete = false; break; }
+                }
+                if (complete) break;
+            }
+        }
+        // Trim trailing undefined slots.
+        const out = [];
+        for (let i = 0; i < active.length; i++) {
+            if (active[i] !== undefined) out.push(active[i]);
+        }
+        return out;
+    }
+
+    // =========================================================================
+    // --- End grouping --------------------------------------------------------
+    // =========================================================================
 
     // --- Selection ---
     // The selection state is a PREDICATE, not a list of IDs. Two modes:
@@ -1205,6 +1638,13 @@ export function createTable(config) {
         visibleRows,
         rowCount,
 
+        // Reactive: grouping + aggregation (M3)
+        groupBy,
+        collapsedGroups,
+        groupedRows,
+        visibleEntries,
+        entryCount,
+
         // Reactive: columns
         columnOrder,
         visibleColumns,
@@ -1240,6 +1680,11 @@ export function createTable(config) {
 
         // Methods: filters
         setColumnFilter, clearColumnFilters,
+
+        // Methods: grouping (M3)
+        setGroupBy, toggleGroup, expandGroup, collapseGroup,
+        expandAllGroups, collapseAllGroups, isGroupCollapsed,
+        groupAncestryAt,
 
         // Methods: editing
         startEdit, commitEdit, cancelEdit, isEditing,
@@ -1374,7 +1819,63 @@ const DEFAULT_STYLES =
     ".lt-filter-input{width:100%;padding:3px 6px;font:inherit;font-size:12px;" +
     "background:#fff;color:#0f172a;border:1px solid #cbd5e1;border-radius:3px;" +
     "outline:none;box-sizing:border-box}" +
-    ".lt-filter-input:focus{border-color:#3b82f6;box-shadow:0 0 0 2px #dbeafe}";
+    ".lt-filter-input:focus{border-color:#3b82f6;box-shadow:0 0 0 2px #dbeafe}" +
+
+    // M3: group-header row -- solid background (never striped), bolder
+    // typography, per-depth indent on the first-visible cell via padding.
+    // The chevron + label are already textual so no icon font required.
+    ".lt-row-group-header{background:#eff6ff;font-weight:600;" +
+    "border-bottom:1px solid #bfdbfe;cursor:pointer;" +
+    // touch-action:none avoids the browser claiming pointermove for
+    // native scroll before our toggle handler fires on tap.
+    "touch-action:manipulation;user-select:none}" +
+    ".lt-row-group-header:hover{background:#dbeafe}" +
+    ".lt-row-group-header .lt-cell{background:inherit;font-weight:inherit;" +
+    "color:#1e3a8a}" +
+    // First cell (chevron + label + count) overflows visibly rather than
+    // getting ellipsized -- the label is the group's identity and the user
+    // needs to read it, even when the first column is narrow (id, checkbox).
+    // Non-first cells keep their normal clipping.
+    ".lt-row-group-header .lt-cell:first-child{overflow:visible;" +
+    "white-space:nowrap;text-overflow:clip;z-index:1;position:relative}" +
+    // Indent the first cell per depth. CSS attribute selectors keep the
+    // effect purely in CSS -- no per-slot inline style writes.
+    ".lt-row-group-header[data-depth=\"0\"] .lt-cell:first-child{padding-left:12px}" +
+    ".lt-row-group-header[data-depth=\"1\"] .lt-cell:first-child{padding-left:28px}" +
+    ".lt-row-group-header[data-depth=\"2\"] .lt-cell:first-child{padding-left:44px}" +
+    ".lt-row-group-header[data-depth=\"3\"] .lt-cell:first-child{padding-left:60px}" +
+    ".lt-row-group-header[data-depth=\"4\"] .lt-cell:first-child{padding-left:76px}" +
+    // Collapsed state: dim the row slightly to hint the group is folded.
+    ".lt-row-group-header[data-collapsed=\"true\"]{opacity:0.85}" +
+    // Aggregate cells (non-first) get a slightly muted color so the
+    // group's key value (in first cell) reads as the identity.
+    ".lt-row-group-header .lt-cell:not(:first-child){color:#3730a3;" +
+    "text-align:right;font-variant-numeric:tabular-nums}" +
+
+    // M3: grand-total row -- pinned appearance (thick top border, sturdy
+    // typography). Sits at the tail of visibleEntries when enabled.
+    ".lt-row-grand-total{background:#f0f9ff;font-weight:700;" +
+    "border-top:2px solid #7dd3fc;border-bottom:1px solid #7dd3fc;" +
+    "color:#0c4a6e}" +
+    ".lt-row-grand-total .lt-cell{background:inherit;font-weight:inherit;" +
+    "color:inherit}" +
+    // First cell (the "Total (N)" label) overflows visibly rather than
+    // getting ellipsized when the first column is narrow. Same rationale
+    // as `.lt-row-group-header .lt-cell:first-child`.
+    ".lt-row-grand-total .lt-cell:first-child{overflow:visible;" +
+    "white-space:nowrap;text-overflow:clip;z-index:1;position:relative}" +
+    ".lt-row-grand-total .lt-cell:not(:first-child){text-align:right;" +
+    "font-variant-numeric:tabular-nums}" +
+
+    // M3: sticky overlays -- containers are zero-height so they don't
+    // reserve scroll space. Their absolute-positioned rows sit on top of
+    // the pool via z-index. Subtle bottom-shadow on sticky group headers
+    // and top-shadow on the sticky footer help them float visually above
+    // the data underneath.
+    ".lt-sticky-groups{}" +
+    ".lt-sticky-group{box-shadow:0 1px 2px rgba(15,23,42,0.08)}" +
+    ".lt-sticky-grand-total{}" +
+    ".lt-sticky-grand-total-row{box-shadow:0 -1px 2px rgba(15,23,42,0.08)}";
 
 let _stylesInjected = new WeakSet();
 function injectStyles(doc) {
@@ -1455,7 +1956,10 @@ export function mountTable(host, table, options) {
         setColumnWidth, moveColumn,
         // M2 surface
         columnFilters, setColumnFilter,
-        editingCell, editingDraft, startEdit, commitEdit, cancelEdit
+        editingCell, editingDraft, startEdit, commitEdit, cancelEdit,
+        // M3 surface
+        visibleEntries, entryCount, groupBy, collapsedGroups, groupedRows,
+        toggleGroup, groupAncestryAt
     } = table;
 
     const { scope, dispose: disposeScope } = createScope();
@@ -1707,7 +2211,11 @@ export function mountTable(host, table, options) {
         overscan
     });
 
-    scope.effect(() => { axis.setCount(rowCount()); });
+    // The virtual axis reserves scroll height for EVERY visible entry --
+    // data rows AND group-header + grand-total rows all take rowHeight.
+    // rowCount (data-only) is exposed on the core for consumer stats but
+    // never drives the axis, or headers would overlap the last data row.
+    scope.effect(() => { axis.setCount(entryCount()); });
     scope.effect(() => { inner.style.height = axis.totalSize() + "px"; });
 
     // ----- Slot pool --------------------------------------------------------
@@ -1717,6 +2225,37 @@ export function mountTable(host, table, options) {
 
     const slots = [];
 
+    // Reactive: which column is currently first-in-display-order. Group
+    // headers put their chevron + label + count in this column's cell;
+    // the aggregate values go into the rest. Recomputes on show/hide/
+    // reorder -- so a hidden first column bumps the label into the next.
+    const firstVisibleColKey = scope.computed(() => {
+        const cols = visibleColumns();
+        return cols.length > 0 ? cols[0].key : null;
+    });
+
+    // Chevron glyphs -- ASCII-adjacent Unicode that renders reliably
+    // across system fonts without a webfont dependency.
+    const CHEVRON_EXPANDED = "\u25BC";  // ▼
+    const CHEVRON_COLLAPSED = "\u25B6"; // ▶
+
+    // Format an aggregate value for display. Uses the column's
+    // `aggregateFormat` if provided, otherwise falls back to String().
+    // Null aggregates render as empty (they mean "no values to aggregate").
+    function _formatAggregate(entry, col) {
+        if (!entry.aggregates) return "";
+        const v = entry.aggregates.get(col.key);
+        if (v == null) return "";
+        if (col.aggregateFormat) {
+            try { return col.aggregateFormat(v, col, entry.count); }
+            catch (err) {
+                try { console.error("lite-table: aggregateFormat threw:", err); } catch (_) {}
+                return String(v);
+            }
+        }
+        return String(v);
+    }
+
     function buildSlot(poolIdx) {
         const rowEl = doc.createElement("div");
         rowEl.className = "lt-row";
@@ -1724,16 +2263,29 @@ export function mountTable(host, table, options) {
 
         const slotIndex = scope.computed(() => axis.start() + poolIdx);
 
+        // The one source of truth for what this pool slot renders. Reads
+        // visibleEntries() so it dispatches on entry.type (data /
+        // group-header / grand-total). All row-level and cell-level
+        // effects below read slotEntry rather than visibleRows/visibleEntries
+        // directly -- keeps every effect down to a single-signal read.
+        const slotEntry = scope.computed(() => {
+            const es = visibleEntries();
+            const i = slotIndex();
+            if (i < 0 || i >= es.length) return null;
+            return es[i];
+        });
+
         // Position (translateY) -- single transform write per boundary cross.
         scope.effect(() => {
             const i = slotIndex();
             rowEl.style.transform = "translateY(" + (i * rowHeight) + "px)";
         });
 
-        // Visibility & aria-rowindex.
+        // Visibility & aria-rowindex driven by entryCount so out-of-bounds
+        // slots hide immediately (e.g. after collapsing a big group).
         scope.effect(() => {
             const i = slotIndex();
-            const n = rowCount();
+            const n = entryCount();
             if (i < 0 || i >= n) {
                 rowEl.style.display = "none";
                 rowEl.removeAttribute("aria-rowindex");
@@ -1743,28 +2295,58 @@ export function mountTable(host, table, options) {
             }
         });
 
-        // Alt striping.
+        // Row-type discriminator: group-header + grand-total get their own
+        // classes and data-attributes. Data rows keep the base .lt-row plus
+        // alt striping. `data-depth` on headers lets the stylesheet indent
+        // per depth without JS style writes.
         scope.effect(() => {
+            const entry = slotEntry();
+            rowEl.classList.remove("lt-row-group-header", "lt-row-grand-total");
+            if (entry === null) {
+                rowEl.removeAttribute("data-depth");
+                rowEl.removeAttribute("data-collapsed");
+                return;
+            }
+            if (entry.type === "group-header") {
+                rowEl.classList.add("lt-row-group-header");
+                rowEl.setAttribute("data-depth", String(entry.depth));
+                rowEl.setAttribute("data-collapsed", entry.isCollapsed ? "true" : "false");
+            } else if (entry.type === "grand-total") {
+                rowEl.classList.add("lt-row-grand-total");
+                rowEl.removeAttribute("data-depth");
+                rowEl.removeAttribute("data-collapsed");
+            } else {
+                rowEl.removeAttribute("data-depth");
+                rowEl.removeAttribute("data-collapsed");
+            }
+        });
+
+        // Alt striping -- data rows only, tied to slotIndex parity of the
+        // data row's ORDINAL POSITION would be ideal, but computing that
+        // requires another walk. Using slotIndex parity (entry position)
+        // gives visually consistent striping across data rows even when
+        // interrupted by group headers -- it just resets at each header.
+        scope.effect(() => {
+            const entry = slotEntry();
             const i = slotIndex();
-            if (i & 1) rowEl.classList.add("lt-row-alt");
+            const isDataAlt = entry !== null && entry.type === "data" && (i & 1);
+            if (isDataAlt) rowEl.classList.add("lt-row-alt");
             else rowEl.classList.remove("lt-row-alt");
         });
 
-        // Selection highlight: bindClass calls isSelected (the predicate),
-        // which transparently handles both whitelist and all-mode selection.
+        // Selection highlight -- data rows only. Group headers and grand
+        // total never appear "selected"; clicking them toggles the group
+        // or does nothing rather than adding to selection.
         scope.onCleanup(bindClass(rowEl, "is-selected", () => {
-            const i = slotIndex();
-            const rs = visibleRows();
-            if (i < 0 || i >= rs.length) return false;
-            return isSelected(getRowId(rs[i]));
+            const entry = slotEntry();
+            if (entry === null || entry.type !== "data") return false;
+            return isSelected(getRowId(entry.row));
         }));
 
-        // aria-selected on the row.
         scope.onCleanup(bindAttr(rowEl, "aria-selected", () => {
-            const i = slotIndex();
-            const rs = visibleRows();
-            if (i < 0 || i >= rs.length) return null;
-            return isSelected(getRowId(rs[i])) ? "true" : "false";
+            const entry = slotEntry();
+            if (entry === null || entry.type !== "data") return null;
+            return isSelected(getRowId(entry.row)) ? "true" : "false";
         }));
 
         // ----- Cells (one per declared column, in DOM config order) ---------
@@ -1774,8 +2356,6 @@ export function mountTable(host, table, options) {
             cellEl.className = "lt-cell";
             cellEl.setAttribute("role", "gridcell");
             cellEl.setAttribute("aria-colindex", String(c + 1));
-            // Static -- never changes for this cell. Read by the delegated
-            // pointerdown handler on root to identify which column was tapped.
             cellEl.setAttribute("data-key", col.key);
 
             // Reactive grid placement / hide.
@@ -1805,100 +2385,103 @@ export function mountTable(host, table, options) {
                 }
             });
 
-            // Reactive text. We use a manual effect (not bindText) so we can
-            // skip the write when this cell is currently being edited -- the
-            // contenteditable cell IS the source of truth while editing, and
-            // any textContent write would clobber the user's caret.
+            // Reactive text -- dispatches on entry.type. Manual effect (not
+            // bindText) so the editing gate can skip the write when this
+            // cell is the active edit target.
             scope.effect(() => {
-                const i = slotIndex();
-                const rs = visibleRows();
-                if (i < 0 || i >= rs.length) { cellEl.textContent = ""; return; }
-                const row = rs[i];
-                // Editing gate: suspend text writes for the cell currently in
-                // edit mode. The effect still tracks `editingCell` so it
-                // resumes the moment editing ends. Tracking visibleRows + col
-                // here means scrolling-during-edit re-points the slot to a
-                // different row; we commit the in-flight edit in that case
-                // (see slot-row scroll effect below) so the suspended write
-                // resumes with the right row's data.
-                if (col.editable) {
-                    const e = editingCell();
-                    if (e !== null && row != null && e.rowId === getRowId(row) && e.columnKey === col.key) {
-                        return;
-                    }
+                const entry = slotEntry();
+                if (entry === null) {
+                    if (cellEl.textContent !== "") cellEl.textContent = "";
+                    return;
                 }
-                const v = readCell(col, row);
-                const text = v == null ? "" : String(v);
-                if (cellEl.textContent !== text) cellEl.textContent = text;
+
+                if (entry.type === "data") {
+                    // Editing gate: suspend text writes while the user is
+                    // typing in this cell -- the contenteditable IS the
+                    // source of truth until commitEdit runs. The effect
+                    // still tracks editingCell so it resumes cleanly.
+                    if (col.editable) {
+                        const e = editingCell();
+                        if (e !== null && e.rowId === getRowId(entry.row) && e.columnKey === col.key) {
+                            return;
+                        }
+                    }
+                    const v = readCell(col, entry.row);
+                    const text = v == null ? "" : String(v);
+                    if (cellEl.textContent !== text) cellEl.textContent = text;
+                    return;
+                }
+
+                if (entry.type === "group-header") {
+                    // First visible column holds the chevron + label.
+                    // (Reads firstVisibleColKey reactively -- column
+                    // hide/reorder repaints the affected cells.)
+                    if (firstVisibleColKey() === col.key) {
+                        const chevron = entry.isCollapsed ? CHEVRON_COLLAPSED : CHEVRON_EXPANDED;
+                        const label = entry.value == null ? "(none)" : String(entry.value);
+                        const text = chevron + "  " + label + "  (" + entry.count + ")";
+                        if (cellEl.textContent !== text) cellEl.textContent = text;
+                    } else {
+                        const text = _formatAggregate(entry, col);
+                        if (cellEl.textContent !== text) cellEl.textContent = text;
+                    }
+                    return;
+                }
+
+                if (entry.type === "grand-total") {
+                    if (firstVisibleColKey() === col.key) {
+                        const text = "Total (" + entry.count + ")";
+                        if (cellEl.textContent !== text) cellEl.textContent = text;
+                    } else {
+                        const text = _formatAggregate(entry, col);
+                        if (cellEl.textContent !== text) cellEl.textContent = text;
+                    }
+                    return;
+                }
             });
 
-            // Reactive id (the aria-activedescendant target).
+            // Reactive id (the aria-activedescendant target). Only data
+            // cells get an id -- headers / totals have no rowId.
             scope.onCleanup(bindAttr(cellEl, "id", () => {
-                const i = slotIndex();
-                const rs = visibleRows();
-                if (i < 0 || i >= rs.length) return null;
-                const row = rs[i];
-                if (row == null) return null;
-                return cellId(getRowId(row), col.key);
+                const entry = slotEntry();
+                if (entry === null || entry.type !== "data") return null;
+                return cellId(getRowId(entry.row), col.key);
             }));
 
-            // Focus indicator. Cheaper than rewriting a <style> element's
-            // textContent because that invalidates CSSOM globally. Here each
-            // cell flips one class; only the 1-2 cells that gain/lose focus
-            // produce classList writes.
+            // Focus indicator. Same restriction -- only data cells can be
+            // focused via the keyboard grid.
             scope.onCleanup(bindClass(cellEl, "is-focused", () => {
-                const i = slotIndex();
-                const rs = visibleRows();
-                if (i < 0 || i >= rs.length) return false;
-                const row = rs[i];
-                if (row == null) return false;
+                const entry = slotEntry();
+                if (entry === null || entry.type !== "data") return false;
                 const f = focusedCell();
                 if (!f) return false;
-                return getRowId(row) === f.rowId && col.key === f.columnKey;
+                return getRowId(entry.row) === f.rowId && col.key === f.columnKey;
             }));
 
-            // Editable cells: manage contenteditable + the editing-flash class.
-            // We only attach this machinery for columns that opted in -- non-
-            // editable cells stay simple text nodes with no event listeners.
+            // Editable machinery is gated on data rows: group-header cells
+            // are visually plain even for editable columns.
             if (col.editable) {
                 cellEl.setAttribute("data-editable", "true");
 
                 // Editing state painted as data + class + contenteditable.
                 scope.effect(() => {
-                    const i = slotIndex();
-                    const rs = visibleRows();
-                    if (i < 0 || i >= rs.length) {
+                    const entry = slotEntry();
+                    if (entry === null || entry.type !== "data") {
                         cellEl.removeAttribute("contenteditable");
                         cellEl.classList.remove("is-editing");
                         return;
                     }
-                    const row = rs[i];
-                    if (row == null) {
-                        cellEl.removeAttribute("contenteditable");
-                        cellEl.classList.remove("is-editing");
-                        return;
-                    }
+                    const row = entry.row;
                     const e = editingCell();
                     const editingThis = e !== null && e.rowId === getRowId(row) && e.columnKey === col.key;
                     if (editingThis) {
                         if (cellEl.getAttribute("contenteditable") !== "true") {
                             cellEl.setAttribute("contenteditable", "true");
-                            // Seed textContent with the draft so what the user
-                            // sees matches what commitEdit will read. Capture
-                            // the draft synchronously to avoid re-running this
-                            // effect on every keystroke (draft changes don't
-                            // need to re-paint anything else).
                             const seed = editingDraft.peek();
                             if (cellEl.textContent !== seed) cellEl.textContent = seed;
-                            // Defer focus to the next microtask so any
-                            // synchronous DOM rearrangement (slot recycle,
-                            // resize) doesn't pre-empt the focus call.
                             queueMicrotask(() => {
                                 if (cellEl.getAttribute("contenteditable") === "true") {
                                     cellEl.focus();
-                                    // Select all so a tab into the cell starts
-                                    // with the whole value highlighted -- the
-                                    // standard spreadsheet idiom.
                                     const sel = doc.getSelection ? doc.getSelection() : null;
                                     if (sel) {
                                         const range = doc.createRange();
@@ -1918,33 +2501,23 @@ export function mountTable(host, table, options) {
                     }
                 });
 
-                // input event: keep the draft in sync with the visible content
-                // so commitEdit (which reads editingDraft) gets the latest.
                 scope.on(cellEl, "input", () => {
-                    // Only act when this cell is the one being edited. Slot
-                    // recycling could in theory fire input on a stale cell
-                    // (it shouldn't if contenteditable isn't set, but the
-                    // guard is cheap).
                     if (cellEl.getAttribute("contenteditable") !== "true") return;
                     editingDraft.set(cellEl.textContent || "");
                 });
 
-                // keydown: Enter commits (and we move down), Escape cancels,
-                // Tab commits (and the browser moves focus).
                 scope.on(cellEl, "keydown", (ev) => {
                     if (cellEl.getAttribute("contenteditable") !== "true") return;
                     if (ev.key === "Escape") {
                         ev.preventDefault();
                         ev.stopPropagation();
                         cancelEdit();
-                        // Restore focus to the root so keyboard nav continues.
                         root.focus();
                     } else if (ev.key === "Enter" && !ev.shiftKey) {
                         ev.preventDefault();
                         ev.stopPropagation();
                         commitEdit();
                         root.focus();
-                        // Move focus to the row below if there is one.
                         moveFocus("down");
                     } else if (ev.key === "Tab") {
                         ev.preventDefault();
@@ -1955,27 +2528,18 @@ export function mountTable(host, table, options) {
                     }
                 });
 
-                // blur: commit. Use focusout so it fires reliably across all
-                // browsers and bubbles through the cell.
                 scope.on(cellEl, "blur", () => {
                     if (cellEl.getAttribute("contenteditable") !== "true") return;
                     commitEdit();
                 });
 
-                // dblclick: start editing this cell.
                 scope.on(cellEl, "dblclick", (ev) => {
-                    const i = slotIndex.peek();
-                    const rs = visibleRows.peek();
-                    if (i < 0 || i >= rs.length) return;
-                    const row = rs[i];
-                    if (row == null) return;
+                    const entry = slotEntry.peek();
+                    if (entry === null || entry.type !== "data") return;
                     ev.preventDefault();
-                    startEdit(getRowId(row), col.key);
+                    startEdit(getRowId(entry.row), col.key);
                 });
             }
-
-            // No pointerdown listener here -- the root has one delegated
-            // listener that uses closest('.lt-cell') + data-key + slot index.
 
             rowEl.appendChild(cellEl);
         }
@@ -1989,6 +2553,254 @@ export function mountTable(host, table, options) {
     scope.effect(() => {
         const want = poolSize();
         while (slots.length < want) slots.push(buildSlot(slots.length));
+    });
+
+    // ----- Sticky group-header + grand-total overlays -----------------------
+    // Both are `position: sticky` zero-height containers that live as
+    // DIRECT CHILDREN OF `.lt-viewport`:
+    //     .lt-sticky-groups         -- inserted BEFORE .lt-inner
+    //     .lt-sticky-grand-total    -- appended AFTER .lt-inner
+    // This matters because `position: sticky` is relative to the element's
+    // natural flow position. Putting them inside .lt-inner (where the pool
+    // slots live absolute) would give both containers a natural position
+    // of 0 -- fine for `top: 32`, WRONG for `bottom: 0` (that only kicks
+    // in when the natural position is BELOW viewport bottom, so a footer
+    // at flow-top just... sits at the top). Placing them around .lt-inner
+    // -- whose height reflects the scrollable content -- gives each the
+    // natural position that matches the sticky edge it's aiming for.
+    //
+    // Design invariants:
+    //   - Sticky headers show the ANCESTORS of visibleEntries[axis.start()].
+    //     If the top-visible entry is itself a group header, its own row is
+    //     drawn by the pool at translateY(start * rowHeight); sticky shows
+    //     only strictly-shallower ancestors, which is [] for a depth-0
+    //     header. No duplication.
+    //   - Sticky grand-total mirrors the last entry's aggregates. When the
+    //     inline grand-total row is scrolled into view, the sticky row sits
+    //     on top of it -- same content, no visible difference.
+    //   - Both are hidden when their prerequisites aren't met (no grouping,
+    //     no grand total configured). Neither injects DOM or effects into
+    //     the ungrouped fast path beyond the two guarding effects.
+
+    // Local lookup so sticky effects don't have to walk `columns` linearly.
+    const _mountColumnsByKey = new Map(columns.map(c => [c.key, c]));
+
+    // Sticky group-headers: BEFORE .lt-inner in the viewport's flow, sticks
+    // at viewport top:<headerHeight> so it clears the sticky column header
+    // (which itself sits at top:0). We use rowHeight for the header height
+    // since that matches the padding+content of `.lt-header-cell` -- if a
+    // consumer restyles the header taller, they'll want a bigger offset.
+    const stickyGroupsEl = doc.createElement("div");
+    stickyGroupsEl.className = "lt-sticky-groups";
+    stickyGroupsEl.setAttribute("aria-hidden", "true");
+    stickyGroupsEl.style.cssText =
+        "position:sticky;top:" + rowHeight + "px;" +
+        "left:0;right:0;height:0;z-index:2;pointer-events:none;";
+    viewport.insertBefore(stickyGroupsEl, inner);
+
+    const _stickyRows = [];
+    function _buildStickyRow(depth) {
+        const rowEl = doc.createElement("div");
+        // NOTE: no `.lt-row` on sticky rows -- the base class is used by
+        // the 1.1.0 test suite (and by consumers) to count pool slots via
+        // `querySelectorAll(".lt-row")`. Sticky rows carry only their
+        // discriminator classes; the grid layout that `.lt-row` provides
+        // is inlined below (display:grid + grid-template-columns).
+        rowEl.className = "lt-row-group-header lt-sticky-group";
+        rowEl.setAttribute("data-depth", String(depth));
+        rowEl.style.cssText =
+            "position:absolute;left:0;right:0;" +
+            "top:" + (depth * rowHeight) + "px;" +
+            "height:" + rowHeight + "px;" +
+            "display:grid;grid-template-columns:var(--lt-cols);" +
+            "width:max-content;min-width:100%;" +
+            "pointer-events:auto;";
+        const cells = new Map();
+        for (let c = 0; c < columns.length; c++) {
+            const col = columns[c];
+            const cellEl = doc.createElement("div");
+            cellEl.className = "lt-cell";
+            cellEl.setAttribute("data-key", col.key);
+            // Reactive per-cell grid placement + pin, matching pool cells so
+            // sticky rows track column reorder / hide / pin the same way.
+            scope.effect(() => {
+                const placement = colPlacement().get(col.key);
+                if (placement == null) {
+                    cellEl.style.display = "none";
+                } else {
+                    cellEl.style.display = "";
+                    cellEl.style.gridColumn = placement + " / span 1";
+                }
+            });
+            scope.effect(() => {
+                const pinSide = col.pin();
+                cellEl.setAttribute("data-pin", pinSide);
+                if (pinSide === "left") {
+                    cellEl.style.left = (leftOffsets().get(col.key) || 0) + "px";
+                    cellEl.style.right = "";
+                } else if (pinSide === "right") {
+                    cellEl.style.right = (rightOffsets().get(col.key) || 0) + "px";
+                    cellEl.style.left = "";
+                } else {
+                    cellEl.style.left = "";
+                    cellEl.style.right = "";
+                }
+            });
+            rowEl.appendChild(cellEl);
+            cells.set(col.key, cellEl);
+        }
+        // Toggle the group by clicking anywhere on the sticky row. Reads the
+        // closure-captured info.currentEntry so we always toggle the group
+        // the row is currently showing, not the one it was built for.
+        const info = { row: rowEl, cells, currentEntry: null };
+        scope.on(rowEl, "pointerdown", (ev) => {
+            if (!ev.isPrimary || ev.button !== 0) return;
+            if (info.currentEntry) toggleGroup(info.currentEntry.path);
+        });
+        return info;
+    }
+
+    // Reactive sync: watch axis.start() + visibleEntries + column changes.
+    // Emits/hides sticky rows to match `groupAncestryAt(axis.start())`.
+    scope.effect(() => {
+        // Ungrouped fast path: hide everything and skip.
+        if (groupBy().length === 0) {
+            stickyGroupsEl.style.display = "none";
+            for (let i = 0; i < _stickyRows.length; i++) {
+                _stickyRows[i].row.style.display = "none";
+                _stickyRows[i].currentEntry = null;
+            }
+            return;
+        }
+        stickyGroupsEl.style.display = "";
+        // Read the FIRST-VISIBLE entry index (no overscan). axis.start()
+        // includes overscan slots above the viewport, so it would show
+        // ancestors of a not-yet-visible entry -- sticky "active" while
+        // the user is already scrolling through "archived" data. Using
+        // firstIndex keeps sticky in lockstep with what's under the
+        // column header line.
+        const ancestors = groupAncestryAt(axis.firstIndex());
+        // Grow the pool of sticky rows to match the current depth.
+        while (_stickyRows.length < ancestors.length) {
+            const info = _buildStickyRow(_stickyRows.length);
+            stickyGroupsEl.appendChild(info.row);
+            _stickyRows.push(info);
+        }
+        // Populate visible slots + hide the rest.
+        const firstKey = firstVisibleColKey();
+        for (let d = 0; d < _stickyRows.length; d++) {
+            const info = _stickyRows[d];
+            const a = ancestors[d];
+            if (a) {
+                info.currentEntry = a;
+                info.row.style.display = "grid";
+                info.row.setAttribute("data-collapsed", a.isCollapsed ? "true" : "false");
+                for (const [colKey, cellEl] of info.cells) {
+                    const col = _mountColumnsByKey.get(colKey);
+                    if (!col) continue;
+                    let text;
+                    if (firstKey === colKey) {
+                        const chevron = a.isCollapsed ? CHEVRON_COLLAPSED : CHEVRON_EXPANDED;
+                        const label = a.value == null ? "(none)" : String(a.value);
+                        text = chevron + "  " + label + "  (" + a.count + ")";
+                    } else {
+                        text = _formatAggregate(a, col);
+                    }
+                    if (cellEl.textContent !== text) cellEl.textContent = text;
+                }
+            } else {
+                info.currentEntry = null;
+                info.row.style.display = "none";
+            }
+        }
+    });
+
+    // Sticky grand-total footer: AFTER .lt-inner in the viewport's flow, so
+    // its natural flow position is at end-of-scroll -- exactly the trigger
+    // condition for `position: sticky; bottom: 0` to pin it at viewport
+    // bottom. When the user scrolls to the very end and the actual last
+    // entry (grand-total, at index entryCount-1) is drawn by the pool at
+    // the same visual y position, the two overlap seamlessly with matching
+    // content (same _formatAggregate call at both sites).
+    const stickyGrandTotalEl = doc.createElement("div");
+    stickyGrandTotalEl.className = "lt-sticky-grand-total";
+    stickyGrandTotalEl.setAttribute("aria-hidden", "true");
+    stickyGrandTotalEl.style.cssText =
+        "position:sticky;bottom:0;left:0;right:0;height:0;z-index:2;pointer-events:none;";
+    viewport.appendChild(stickyGrandTotalEl);
+
+    const stickyGrandTotalRow = doc.createElement("div");
+    // See `_buildStickyRow` note: no `.lt-row` on sticky rows so pool-slot
+    // counters (querySelectorAll(".lt-row")) aren't inflated.
+    stickyGrandTotalRow.className = "lt-row-grand-total lt-sticky-grand-total-row";
+    // Position ABOVE the (height:0) sticky container: `top: -rowHeight` puts
+    // the row's top edge one rowHeight ABOVE the container, so the row's
+    // bottom edge coincides with the container's top -- which is glued to
+    // viewport bottom by the sticky rule on the container. This is more
+    // robust than `bottom: 0` inside a height:0 containing block, where
+    // some browsers resolve "0 from bottom of a 0-height box" as "at the
+    // container's top" (which puts the row BELOW the viewport).
+    stickyGrandTotalRow.style.cssText =
+        "position:absolute;left:0;right:0;" +
+        "top:-" + rowHeight + "px;" +
+        "height:" + rowHeight + "px;" +
+        "display:grid;grid-template-columns:var(--lt-cols);" +
+        "width:max-content;min-width:100%;" +
+        "pointer-events:auto;";
+    const _stickyGtCells = new Map();
+    for (let c = 0; c < columns.length; c++) {
+        const col = columns[c];
+        const cellEl = doc.createElement("div");
+        cellEl.className = "lt-cell";
+        cellEl.setAttribute("data-key", col.key);
+        scope.effect(() => {
+            const placement = colPlacement().get(col.key);
+            if (placement == null) {
+                cellEl.style.display = "none";
+            } else {
+                cellEl.style.display = "";
+                cellEl.style.gridColumn = placement + " / span 1";
+            }
+        });
+        scope.effect(() => {
+            const pinSide = col.pin();
+            cellEl.setAttribute("data-pin", pinSide);
+            if (pinSide === "left") {
+                cellEl.style.left = (leftOffsets().get(col.key) || 0) + "px";
+                cellEl.style.right = "";
+            } else if (pinSide === "right") {
+                cellEl.style.right = (rightOffsets().get(col.key) || 0) + "px";
+                cellEl.style.left = "";
+            } else {
+                cellEl.style.left = "";
+                cellEl.style.right = "";
+            }
+        });
+        stickyGrandTotalRow.appendChild(cellEl);
+        _stickyGtCells.set(col.key, cellEl);
+    }
+    stickyGrandTotalEl.appendChild(stickyGrandTotalRow);
+
+    scope.effect(() => {
+        const entries = visibleEntries();
+        const last = entries.length > 0 ? entries[entries.length - 1] : null;
+        if (!last || last.type !== "grand-total") {
+            stickyGrandTotalEl.style.display = "none";
+            return;
+        }
+        stickyGrandTotalEl.style.display = "";
+        const firstKey = firstVisibleColKey();
+        for (const [colKey, cellEl] of _stickyGtCells) {
+            const col = _mountColumnsByKey.get(colKey);
+            if (!col) continue;
+            let text;
+            if (firstKey === colKey) {
+                text = "Total (" + last.count + ")";
+            } else {
+                text = _formatAggregate(last, col);
+            }
+            if (cellEl.textContent !== text) cellEl.textContent = text;
+        }
     });
 
     // ----- Delegated pointerdown on root ------------------------------------
@@ -2007,17 +2819,31 @@ export function mountTable(host, table, options) {
         const poolIdx = slots.indexOf(rowEl);
         if (poolIdx < 0) return;
         const slotIdx = untrack(() => axis.start()) + poolIdx;
-        const rs = untrack(() => visibleRows());
-        if (slotIdx < 0 || slotIdx >= rs.length) return;
-        const row = rs[slotIdx];
+        const es = untrack(() => visibleEntries());
+        if (slotIdx < 0 || slotIdx >= es.length) return;
+        const entry = es[slotIdx];
+        if (entry == null) return;
+
+        // Group-header rows are toggles, not selections. Any click on the
+        // header collapses/expands its subtree -- we don't wire this to
+        // just the chevron because a bigger hit target is friendlier on
+        // touch, and there's nothing else meaningful to do with a
+        // header-row click. Selection + focus stay untouched.
+        if (entry.type === "group-header") {
+            toggleGroup(entry.path);
+            return;
+        }
+        // Grand-total row is decorative -- ignore clicks entirely so it
+        // doesn't clear the current selection when the user taps it.
+        if (entry.type === "grand-total") return;
+
+        const row = entry.row;
         if (row == null) return;
         const rowId = getRowId(row);
         if (ev.shiftKey) selectRow(rowId, "range");
         else if (ev.ctrlKey || ev.metaKey) selectRow(rowId, "toggle");
         else selectRow(rowId, "set");
         focusedCell.set({ rowId, columnKey: colKey });
-        // No preventDefault -- preserves native text selection on mouse and
-        // scroll initiation on touch.
     });
 
     // ----- aria-activedescendant --------------------------------------------

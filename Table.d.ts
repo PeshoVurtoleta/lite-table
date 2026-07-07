@@ -47,11 +47,26 @@ export interface ColumnDef<Row = any, Value = unknown> {
     filter?: (value: Value, query: string, row: Row) => boolean;
     /** M2: placeholder text for the filter input. Default "Filter…". */
     filterPlaceholder?: string;
+    /** M3: aggregate reducer for group-header + grand-total cells. One of the
+     *  built-in strings, or a custom `(rows, col) => value` function. `null`
+     *  or omitted means "no aggregate" -- the column shows blank in header
+     *  rows. Aggregates always fold over LEAF rows at every depth (safe
+     *  for non-associative reducers like median or last-value-wins). */
+    aggregate?: AggregateSpec<Row> | null;
+    /** M3: format the aggregate for display. Only affects rendered text --
+     *  `entry.aggregates.get(key)` still returns the raw value so consumers
+     *  can format independently for export etc. Errors are caught + logged. */
+    aggregateFormat?: (value: unknown, col: ColumnState<Row>, count: number) => string;
     /** Computed value override; if absent, `row[key]` is used. */
     accessor?: (row: Row) => Value;
     /** Sort comparator; default is null-safe number-or-string compare. */
     compare?: (a: Value, b: Value) => number;
 }
+
+/** M3: aggregate spec on a column. */
+export type AggregateSpec<Row = any> =
+    | "sum" | "avg" | "min" | "max" | "count"
+    | ((rows: readonly Row[], col: ColumnState<Row>) => unknown);
 
 /** Live reactive state for a column, exposed on `table.columns[i]`. */
 export interface ColumnState<Row = any> {
@@ -152,6 +167,69 @@ export interface CreateTableConfig<Row = any> {
      *  optimistic update, etc.). Skipped when newValue === oldValue.
      *  Errors thrown by the handler are caught + logged. */
     onCellEdit?: (payload: CellEditPayload<Row>) => void | Promise<unknown>;
+
+    /** M3: group rows by one or more column keys. `null` (default) or an
+     *  empty array = no grouping. A bare string is normalized to `[string]`.
+     *  Unknown column keys are silently dropped so persisted state that
+     *  outlives a column config survives without crashes. */
+    groupBy?: string | readonly string[] | null;
+    /** M3: pre-seed the collapsed set. Each entry is a group path -- e.g.
+     *  `[["Europe"], ["Asia", "Books"]]`. Unknown paths become no-ops when
+     *  their groups don't exist. */
+    initialCollapsedGroups?: readonly (readonly string[])[];
+    /** M3: append a grand-total entry at the tail of `visibleEntries` when
+     *  any column has an `aggregate` spec. Grand-total aggregates fold
+     *  over `filteredRows()` and are stable across collapse operations. */
+    showGrandTotal?: boolean;
+}
+
+// --- M3: grouping + aggregation types ---------------------------------------
+
+/** One node in the grouped-rows tree. Leaf nodes have `rows` populated and
+ *  `subGroups: null`; internal nodes have `subGroups` populated and
+ *  `rows: null`. Aggregates always fold over leaf rows recursively. */
+export interface GroupNode<Row = any> {
+    readonly depth: number;
+    /** The column key this depth groups on. */
+    readonly key: string;
+    /** The group's identifying value (post-`accessor`). `null` for the
+     *  null / undefined bucket. */
+    readonly value: unknown;
+    /** Path of ancestor values including this node. e.g. `["Europe", "Books"]`. */
+    readonly path: readonly string[];
+    /** Stringified path (U+001F separator) -- the storage key for the
+     *  collapsed-groups Set. */
+    readonly pathStr: string;
+    /** Recursive leaf-row count. */
+    readonly count: number;
+    readonly aggregates: ReadonlyMap<string, unknown>;
+    readonly subGroups: readonly GroupNode<Row>[] | null;
+    readonly rows: readonly Row[] | null;
+}
+
+/** A row in `visibleEntries`. The mount layer dispatches per-slot rendering
+ *  on `type`. */
+export type Entry<Row = any> = DataEntry<Row> | GroupHeaderEntry | GrandTotalEntry;
+
+export interface DataEntry<Row = any> {
+    readonly type: "data";
+    readonly row: Row;
+}
+export interface GroupHeaderEntry {
+    readonly type: "group-header";
+    readonly depth: number;
+    readonly key: string;
+    readonly value: unknown;
+    readonly path: readonly string[];
+    readonly pathStr: string;
+    readonly count: number;
+    readonly aggregates: ReadonlyMap<string, unknown>;
+    readonly isCollapsed: boolean;
+}
+export interface GrandTotalEntry {
+    readonly type: "grand-total";
+    readonly aggregates: ReadonlyMap<string, unknown>;
+    readonly count: number;
 }
 
 // --- Export option types ----------------------------------------------------
@@ -214,6 +292,28 @@ export interface TableCore<Row = any> {
     readonly filteredRows: Computed<readonly Row[]>;
     readonly visibleRows: Computed<readonly Row[]>;
     readonly rowCount: Computed<number>;
+
+    // ---- Reactive: grouping + aggregation (M3) ----
+    /** Current grouping keys. Empty array = no grouping (fast path).
+     *  Assign via `setGroupBy`; the raw signal is exposed for read-only
+     *  access + persistence with `@zakkster/lite-persist`. */
+    readonly groupBy: Signal<readonly string[]>;
+    /** Set of collapsed group path-strings (U+001F separator). Mutated via
+     *  `toggleGroup`, `collapseGroup`, `expandGroup`, `collapseAllGroups`,
+     *  `expandAllGroups`. `isGroupCollapsed(path)` is the O(1) predicate. */
+    readonly collapsedGroups: Signal<ReadonlySet<string>>;
+    /** Grouped tree of `filteredRows`, sorted within leaves per `sortChain`.
+     *  `null` when `groupBy` is empty -- consumers can branch on this to
+     *  render a flat list without walking the tree. */
+    readonly groupedRows: Computed<readonly GroupNode<Row>[] | null>;
+    /** Flat interleaved list of `{type: "data" | "group-header" | "grand-total"}`
+     *  entries. Drives the mount layer's slot rendering. Length matches
+     *  `entryCount()`. */
+    readonly visibleEntries: Computed<readonly Entry<Row>[]>;
+    /** Total entry count including group headers + grand total. Drives the
+     *  virtual axis in the mount layer -- `rowCount` (data-only) is kept
+     *  as a separate consumer stat. */
+    readonly entryCount: Computed<number>;
 
     // ---- Reactive: columns ----
     readonly columnOrder: Signal<readonly string[]>;
@@ -292,6 +392,30 @@ export interface TableCore<Row = any> {
     setColumnFilter(key: string, value: string | null | undefined): void;
     /** Clear all filters. No-op + no notify if the filter map is already empty. */
     clearColumnFilters(): void;
+
+    // ---- Methods: grouping (M3) ----
+    /** Set the grouping keys. Accepts a bare string, a string[], or
+     *  null/empty (no grouping). Unknown column keys are silently dropped.
+     *  Idempotent -- setting the same effective value is a no-op that
+     *  doesn't churn the signal. */
+    setGroupBy(v: string | readonly string[] | null): void;
+    /** Flip the collapsed state for the given group path. */
+    toggleGroup(path: readonly string[]): void;
+    /** Expand a specific group (no-op if already expanded). */
+    expandGroup(path: readonly string[]): void;
+    /** Collapse a specific group (no-op if already collapsed). */
+    collapseGroup(path: readonly string[]): void;
+    /** Expand every group -- clears the collapsed set. */
+    expandAllGroups(): void;
+    /** Collapse every group in the current tree. Walks `groupedRows()` once. */
+    collapseAllGroups(): void;
+    /** O(1) predicate: is this exact group path currently collapsed? */
+    isGroupCollapsed(path: readonly string[]): boolean;
+    /** Given an entry index (typically `axis.start()`), return the group
+     *  headers that CONTAIN it -- one per depth level, deepest last.
+     *  Used by consumers implementing sticky group headers. Returns [] for
+     *  the ungrouped fast path or when the target is above the first header. */
+    groupAncestryAt(entryIndex: number): readonly GroupHeaderEntry[];
 
     // ---- Methods: editing (M2) ----
     /** Start editing the (rowId, columnKey) cell. No-op on non-editable

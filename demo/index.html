@@ -1,325 +1,517 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>@zakkster/lite-table demo</title>
-<style>
-    :root {
-        color-scheme: dark;
-        --bg: #0b1220;
-        --panel: #131c2f;
-        --panel-2: #172033;
-        --border: #1f2937;
-        --border-2: #334155;
-        --text: #e2e8f0;
-        --muted: #94a3b8;
-        --accent: #60a5fa;
-        --accent-2: #3b82f6;
-        --warn: #f59e0b;
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>@zakkster/lite-table demo</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #0b1220;
+            --panel: #131c2f;
+            --panel-2: #172033;
+            --border: #1f2937;
+            --border-2: #334155;
+            --text: #e2e8f0;
+            --muted: #94a3b8;
+            --accent: #60a5fa;
+            --accent-2: #3b82f6;
+            --warn: #f59e0b;
 
-        /* Spacing scale -- in rem so the whole layout scales with the user's
-           browser font-size setting. */
-        --gap-xs: 0.25rem;   /*  4px @ 16px root */
-        --gap-sm: 0.375rem;  /*  6px */
-        --gap-md: 0.75rem;   /* 12px */
-        --gap-lg: 1rem;      /* 16px */
+            /* Spacing scale -- in rem so the whole layout scales with the user's
+               browser font-size setting. */
+            --gap-xs: 0.25rem; /*  4px @ 16px root */
+            --gap-sm: 0.375rem; /*  6px */
+            --gap-md: 0.75rem; /* 12px */
+            --gap-lg: 1rem; /* 16px */
 
-        /* Layout sizes that need to track real device viewport (dvh/dvw
-           account for mobile browser chrome that vh ignores). */
-        --sidebar-w: 17.5rem;  /* 280px @ 16px root */
-        --radius: 0.375rem;
-    }
-    * { box-sizing: border-box; }
-    html, body {
-        height: 100dvh;          /* dvh, not vh -- mobile-safe */
-        overflow: hidden;
-    }
-    body {
-        margin: 0;
-        background: var(--bg);
-        color: var(--text);
-        font-family: system-ui, sans-serif;
-        font-size: 0.875rem;     /* ~14px */
-        display: grid;
-        grid-template-columns: var(--sidebar-w) 1fr;
-        grid-template-rows: auto 1fr auto;
-        gap: var(--gap-md);
-        padding: var(--gap-md);
-    }
-    header {
-        grid-column: 1 / -1;
-        display: flex;
-        align-items: baseline;
-        gap: var(--gap-md);
-        padding: 0 var(--gap-xs);
-        flex-wrap: wrap;
-    }
-    h1 {
-        font-size: 1.125rem;
-        margin: 0;
-        font-weight: 600;
-        letter-spacing: -0.01em;
-    }
-    .sub {
-        color: var(--muted);
-        font-size: 0.75rem;
-    }
-    aside {
-        background: var(--panel);
-        border: 1px solid var(--border);
-        border-radius: var(--radius);
-        padding: var(--gap-md);
-        overflow-y: auto;
-        display: flex;
-        flex-direction: column;
-        gap: 0.5rem;        /* tightened from 0.875rem -- M2 added Filter + Export panels */
-        min-height: 0;
-    }
-    aside h2 {
-        font-size: 0.6875rem;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        color: var(--muted);
-        margin: 0 0 var(--gap-xs);
-        font-weight: 600;
-    }
-    .panel-group {
-        display: flex;
-        flex-direction: column;
-        gap: var(--gap-sm);
-    }
-    .row {
-        display: flex;
-        gap: var(--gap-sm);
-        flex-wrap: wrap;
-        align-items: center;
-    }
-    button, .btn {
-        background: var(--panel-2);
-        color: var(--text);
-        border: 1px solid var(--border-2);
-        border-radius: var(--radius);
-        padding: 0.3125rem 0.625rem;
-        font-size: 0.75rem;
-        cursor: pointer;
-        font-family: inherit;
-        line-height: 1.4;
-        touch-action: manipulation;
-    }
-    button:hover { background: #1e293b; border-color: #475569; }
-    button:active { background: #0f172a; }
-    button.is-active { border-color: var(--accent); color: var(--accent); }
-    input[type="number"], input[type="text"], select {
-        background: var(--bg);
-        color: var(--text);
-        border: 1px solid var(--border-2);
-        border-radius: var(--radius);
-        padding: 0.3125rem 0.5rem;
-        font-size: 0.75rem;
-        font-family: inherit;
-        width: 100%;
-    }
-    input[type="number"] { width: 5.625rem; }
-    label {
-        display: flex;
-        align-items: center;
-        gap: var(--gap-sm);
-        font-size: 0.75rem;
-        cursor: pointer;
-        padding: 0.1875rem 0;
-    }
-    input[type="checkbox"] { accent-color: var(--accent); width: 1rem; height: 1rem; }
-    .col-row {
-        display: grid;
-        grid-template-columns: 1fr auto;
-        gap: var(--gap-xs);
-        align-items: center;
-        padding: 0.25rem 0;
-        border-bottom: 1px solid var(--border);
-    }
-    .col-row:last-child { border-bottom: 0; }
-    .col-row .name-line {
-        display: flex;
-        align-items: center;
-        gap: var(--gap-sm);
-    }
-    .col-row .pin-line {
-        display: flex;
-        align-items: center;
-        gap: 0.125rem;
-    }
-    .col-row .pin-line-label {
-        font-size: 0.625rem;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        color: var(--muted);
-        margin-right: var(--gap-sm);
-    }
-    .col-name { font-weight: 500; }
-    .pin-btn {
-        padding: 0.125rem 0.5rem;
-        font-size: 0.6875rem;
-        min-width: 1.75rem;
-        font-family: ui-monospace, monospace;
-    }
-    main {
-        grid-column: 2;
-        grid-row: 2;
-        background: var(--panel);
-        border: 1px solid var(--border);
-        border-radius: var(--radius);
-        overflow: hidden;
-        min-height: 0;
-        min-width: 0;         /* allow grid item to shrink for h-scroll */
-    }
-    footer {
-        grid-column: 1 / -1;
-        display: flex;
-        gap: var(--gap-lg);
-        align-items: center;
-        flex-wrap: wrap;
-        font-size: 0.75rem;
-        color: var(--muted);
-        padding: var(--gap-sm) var(--gap-md);
-        background: var(--panel);
-        border: 1px solid var(--border);
-        border-radius: var(--radius);
-    }
-    footer .stat { font-variant-numeric: tabular-nums; }
-    footer .stat b { color: var(--accent); font-weight: 600; }
-
-    .kbd-help { font-size: 0.6875rem; line-height: 1.5; color: var(--muted); }
-    .kbd-help kbd {
-        background: var(--panel-2);
-        border: 1px solid var(--border-2);
-        border-radius: 3px;
-        padding: 1px 5px;
-        font-family: ui-monospace, monospace;
-        font-size: 0.625rem;
-        color: var(--text);
-    }
-
-    /* Drawer toggle button -- hidden on desktop, shown on mobile. */
-    .drawer-toggle {
-        display: none;
-        background: var(--panel-2);
-        color: var(--text);
-        border: 1px solid var(--border-2);
-        border-radius: var(--radius);
-        padding: 0.375rem 0.625rem;
-        font-size: 1rem;
-        line-height: 1;
-        cursor: pointer;
-    }
-    .drawer-toggle:hover { background: #1e293b; }
-    .backdrop { display: none; }
-
-    /* ------ Mobile / narrow layout ----------------------------------------
-       Sidebar becomes a slide-out drawer triggered by the hamburger button.
-       Default state: drawer closed, main fills the screen. */
-    @media (max-width: 50rem) {
-        body {
-            grid-template-columns: 1fr;
-            grid-template-rows: auto 1fr auto;
+            /* Layout sizes that need to track real device viewport (dvh/dvw
+               account for mobile browser chrome that vh ignores). */
+            --sidebar-w: 17.5rem; /* 280px @ 16px root */
+            --radius: 0.375rem;
         }
-        h1 { font-size: 1rem; }
-        .drawer-toggle { display: inline-flex; align-items: center; }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html, body {
+            height: 100dvh; /* dvh, not vh -- mobile-safe */
+            overflow: hidden;
+        }
+
+        body {
+            margin: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: system-ui, sans-serif;
+            font-size: 0.875rem; /* ~14px */
+            display: grid;
+            grid-template-columns: var(--sidebar-w) 1fr;
+            grid-template-rows: auto 1fr auto;
+            gap: var(--gap-md);
+            padding: var(--gap-md);
+        }
+
+        header {
+            grid-column: 1 / -1;
+            display: flex;
+            align-items: baseline;
+            gap: var(--gap-md);
+            padding: 0 var(--gap-xs);
+            flex-wrap: wrap;
+        }
+
+        h1 {
+            font-size: 1.125rem;
+            margin: 0;
+            font-weight: 600;
+            letter-spacing: -0.01em;
+        }
+
+        .sub {
+            color: var(--muted);
+            font-size: 0.75rem;
+        }
 
         aside {
-            position: fixed;
-            top: 0;
-            left: 0;
-            height: 100dvh;
-            width: min(85vw, 22rem);
-            max-height: none;
-            margin: 0;
-            border-radius: 0;
-            border-right: 1px solid var(--border);
-            z-index: 20;
-            transform: translateX(-101%);
-            transition: transform 0.18s ease-out;
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: var(--gap-md);
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem; /* tightened from 0.875rem -- M2 added Filter + Export panels */
+            min-height: 0;
         }
-        body.drawer-open aside { transform: translateX(0); }
+
+        aside h2 {
+            font-size: 0.6875rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--muted);
+            margin: 0 0 var(--gap-xs);
+            font-weight: 600;
+        }
+
+        .panel-group {
+            display: flex;
+            flex-direction: column;
+            gap: var(--gap-sm);
+        }
+
+        .row {
+            display: flex;
+            gap: var(--gap-sm);
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        button, .btn {
+            background: var(--panel-2);
+            color: var(--text);
+            border: 1px solid var(--border-2);
+            border-radius: var(--radius);
+            padding: 0.3125rem 0.625rem;
+            font-size: 0.75rem;
+            cursor: pointer;
+            font-family: inherit;
+            line-height: 1.4;
+            touch-action: manipulation;
+        }
+
+        button:hover {
+            background: #1e293b;
+            border-color: #475569;
+        }
+
+        button:active {
+            background: #0f172a;
+        }
+
+        button.is-active {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        input[type="number"], input[type="text"], select {
+            background: var(--bg);
+            color: var(--text);
+            border: 1px solid var(--border-2);
+            border-radius: var(--radius);
+            padding: 0.3125rem 0.5rem;
+            font-size: 0.75rem;
+            font-family: inherit;
+            width: 100%;
+        }
+
+        input[type="number"] {
+            width: 5.625rem;
+        }
+
+        label {
+            display: flex;
+            align-items: center;
+            gap: var(--gap-sm);
+            font-size: 0.75rem;
+            cursor: pointer;
+            padding: 0.1875rem 0;
+        }
+
+        input[type="checkbox"] {
+            accent-color: var(--accent);
+            width: 1rem;
+            height: 1rem;
+        }
+
+        .col-row {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: var(--gap-xs);
+            align-items: center;
+            padding: 0.25rem 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .col-row:last-child {
+            border-bottom: 0;
+        }
+
+        .col-row .name-line {
+            display: flex;
+            align-items: center;
+            gap: var(--gap-sm);
+        }
+
+        .col-row .pin-line {
+            display: flex;
+            align-items: center;
+            gap: 0.125rem;
+        }
+
+        .col-row .pin-line-label {
+            font-size: 0.625rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--muted);
+            margin-right: var(--gap-sm);
+        }
+
+        .col-name {
+            font-weight: 500;
+        }
+
+        .pin-btn {
+            padding: 0.125rem 0.5rem;
+            font-size: 0.6875rem;
+            min-width: 1.75rem;
+            font-family: ui-monospace, monospace;
+        }
+
+        main {
+            grid-column: 2;
+            grid-row: 2;
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            overflow: hidden;
+            min-height: 0;
+            min-width: 0; /* allow grid item to shrink for h-scroll */
+        }
+
+        footer {
+            grid-column: 1 / -1;
+            display: flex;
+            gap: var(--gap-lg);
+            align-items: center;
+            flex-wrap: wrap;
+            font-size: 0.75rem;
+            color: var(--muted);
+            padding: var(--gap-sm) var(--gap-md);
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+        }
+
+        footer .stat {
+            font-variant-numeric: tabular-nums;
+        }
+
+        footer .stat b {
+            color: var(--accent);
+            font-weight: 600;
+        }
+
+        .kbd-help {
+            font-size: 0.6875rem;
+            line-height: 1.5;
+            color: var(--muted);
+        }
+
+        .kbd-help kbd {
+            background: var(--panel-2);
+            border: 1px solid var(--border-2);
+            border-radius: 3px;
+            padding: 1px 5px;
+            font-family: ui-monospace, monospace;
+            font-size: 0.625rem;
+            color: var(--text);
+        }
+
+        /* Drawer toggle button -- hidden on desktop, shown on mobile. */
+        .drawer-toggle {
+            display: none;
+            background: var(--panel-2);
+            color: var(--text);
+            border: 1px solid var(--border-2);
+            border-radius: var(--radius);
+            padding: 0.375rem 0.625rem;
+            font-size: 1rem;
+            line-height: 1;
+            cursor: pointer;
+        }
+
+        .drawer-toggle:hover {
+            background: #1e293b;
+        }
 
         .backdrop {
             display: none;
-            position: fixed;
-            inset: 0;
-            background: rgba(0, 0, 0, 0.45);
-            z-index: 15;
         }
-        body.drawer-open .backdrop { display: block; }
-    }
 
-    /* Larger touch targets on coarse pointers (touch screens, styluses). */
-    @media (pointer: coarse) {
-        button, .btn { padding: 0.5rem 0.875rem; font-size: 0.875rem; }
-        .pin-btn { min-width: 2rem; padding: 0.25rem 0.5rem; }
-    }
+        /* ------ Mobile / narrow layout ----------------------------------------
+           Sidebar becomes a slide-out drawer triggered by the hamburger button.
+           Default state: drawer closed, main fills the screen. */
+        @media (max-width: 50rem) {
+            body {
+                grid-template-columns: 1fr;
+                grid-template-rows: auto 1fr auto;
+            }
 
-    /* ------ Theme overrides for the grid against the dark page ------------- */
-    .lt-root {
-        background: var(--panel) !important;
-        border-color: var(--border) !important;
-        color: var(--text) !important;
-        --lt-pin-bg: var(--panel);
-        --lt-pin-alt-bg: var(--panel-2);
-    }
-    .lt-header { background: var(--bg) !important; border-color: var(--border) !important; }
-    .lt-header-cell { color: #cbd5e1 !important; border-color: var(--border) !important; background: var(--bg) !important; }
-    .lt-header-cell.is-sortable:hover { background: #0f172a !important; }
-    .lt-header-cell[data-pin="left"], .lt-header-cell[data-pin="right"] { background: var(--bg) !important; }
-    .lt-row { border-color: var(--border) !important; background: var(--panel) !important; }
-    .lt-row.lt-row-alt { background: var(--panel-2) !important; }
-    .lt-row.is-selected { background: #1e3a8a !important; }
-    .lt-row.is-selected.lt-row-alt { background: #1e40af !important; }
-    .lt-cell { border-color: var(--border) !important; }
-    .lt-cell.is-focused { outline: 2px solid var(--accent) !important; outline-offset: -2px !important; }
-    .lt-cell.is-editing { outline: 2px solid var(--warn) !important; outline-offset: -2px !important; background: #1e1b1a !important; }
-    .lt-header-resize { width: 0.5rem !important; }
-    .lt-header-resize:hover, .lt-header-resize.is-active { background: var(--accent-2) !important; }
-    .lt-header-cell.is-drop-before { box-shadow: 2px 0 0 var(--accent) inset !important; }
-    .lt-header-cell.is-drop-after { box-shadow: -2px 0 0 var(--accent) inset !important; }
+            h1 {
+                font-size: 1rem;
+            }
 
-    /* ------ M2: filter row + edit overrides for the dark theme -------------
-       The library's default `.lt-filter-row { top: 32px }` was designed
-       assuming the filter row would sit INSIDE the viewport (sticking below
-       the header during scroll). The actual implementation puts it OUTSIDE
-       the viewport, so the 32px offset just shifts the row down INTO the
-       header's stacking region -- the filter row with z-index:4 ends up
-       covering the header at z-index:3. Forcing top:0 puts the filter row
-       at its natural flex-column position above the viewport, where it
-       belongs. */
-    .lt-filter-row {
-        background: var(--bg) !important;
-        border-bottom-color: var(--border) !important;
-        top: 0 !important;
-    }
-    .lt-filter-cell[data-pin="left"],
-    .lt-filter-cell[data-pin="right"] { background: var(--bg) !important; }
-    .lt-filter-input {
-        background: var(--panel-2) !important;
-        color: var(--text) !important;
-        border-color: var(--border-2) !important;
-    }
-    .lt-filter-input:focus {
-        border-color: var(--accent) !important;
-        box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.25) !important;
-    }
+            .drawer-toggle {
+                display: inline-flex;
+                align-items: center;
+            }
 
-    /* Bigger resize handle on touch. */
-    @media (pointer: coarse) {
-        .lt-header-resize { width: 0.875rem !important; }
-    }
-</style>
+            aside {
+                position: fixed;
+                top: 0;
+                left: 0;
+                height: 100dvh;
+                width: min(85vw, 22rem);
+                max-height: none;
+                margin: 0;
+                border-radius: 0;
+                border-right: 1px solid var(--border);
+                z-index: 20;
+                transform: translateX(-101%);
+                transition: transform 0.18s ease-out;
+            }
+
+            body.drawer-open aside {
+                transform: translateX(0);
+            }
+
+            .backdrop {
+                display: none;
+                position: fixed;
+                inset: 0;
+                background: rgba(0, 0, 0, 0.45);
+                z-index: 15;
+            }
+
+            body.drawer-open .backdrop {
+                display: block;
+            }
+        }
+
+        /* Larger touch targets on coarse pointers (touch screens, styluses). */
+        @media (pointer: coarse) {
+            button, .btn {
+                padding: 0.5rem 0.875rem;
+                font-size: 0.875rem;
+            }
+
+            .pin-btn {
+                min-width: 2rem;
+                padding: 0.25rem 0.5rem;
+            }
+        }
+
+        /* ------ Theme overrides for the grid against the dark page ------------- */
+        .lt-root {
+            background: var(--panel) !important;
+            border-color: var(--border) !important;
+            color: var(--text) !important;
+            --lt-pin-bg: var(--panel);
+            --lt-pin-alt-bg: var(--panel-2);
+        }
+
+        .lt-header {
+            background: var(--bg) !important;
+            border-color: var(--border) !important;
+        }
+
+        .lt-header-cell {
+            color: #cbd5e1 !important;
+            border-color: var(--border) !important;
+            background: var(--bg) !important;
+        }
+
+        .lt-header-cell.is-sortable:hover {
+            background: #0f172a !important;
+        }
+
+        .lt-header-cell[data-pin="left"], .lt-header-cell[data-pin="right"] {
+            background: var(--bg) !important;
+        }
+
+        .lt-row {
+            border-color: var(--border) !important;
+            background: var(--panel) !important;
+        }
+
+        .lt-row.lt-row-alt {
+            background: var(--panel-2) !important;
+        }
+
+        .lt-row.is-selected {
+            background: #1e3a8a !important;
+        }
+
+        .lt-row.is-selected.lt-row-alt {
+            background: #1e40af !important;
+        }
+
+        .lt-cell {
+            border-color: var(--border) !important;
+        }
+
+        .lt-cell.is-focused {
+            outline: 2px solid var(--accent) !important;
+            outline-offset: -2px !important;
+        }
+
+        .lt-cell.is-editing {
+            outline: 2px solid var(--warn) !important;
+            outline-offset: -2px !important;
+            background: #1e1b1a !important;
+        }
+
+        .lt-header-resize {
+            width: 0.5rem !important;
+        }
+
+        .lt-header-resize:hover, .lt-header-resize.is-active {
+            background: var(--accent-2) !important;
+        }
+
+        .lt-header-cell.is-drop-before {
+            box-shadow: 2px 0 0 var(--accent) inset !important;
+        }
+
+        .lt-header-cell.is-drop-after {
+            box-shadow: -2px 0 0 var(--accent) inset !important;
+        }
+
+        /* ------ M2: filter row + edit overrides for the dark theme -------------
+           The library's default `.lt-filter-row { top: 32px }` was designed
+           assuming the filter row would sit INSIDE the viewport (sticking below
+           the header during scroll). The actual implementation puts it OUTSIDE
+           the viewport, so the 32px offset just shifts the row down INTO the
+           header's stacking region -- the filter row with z-index:4 ends up
+           covering the header at z-index:3. Forcing top:0 puts the filter row
+           at its natural flex-column position above the viewport, where it
+           belongs. */
+        .lt-filter-row {
+            background: var(--bg) !important;
+            border-bottom-color: var(--border) !important;
+            top: 0 !important;
+        }
+
+        .lt-filter-cell[data-pin="left"],
+        .lt-filter-cell[data-pin="right"] {
+            background: var(--bg) !important;
+        }
+
+        .lt-filter-input {
+            background: var(--panel-2) !important;
+            color: var(--text) !important;
+            border-color: var(--border-2) !important;
+        }
+
+        .lt-filter-input:focus {
+            border-color: var(--accent) !important;
+            box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.25) !important;
+        }
+
+        /* Bigger resize handle on touch. */
+        @media (pointer: coarse) {
+            .lt-header-resize {
+                width: 0.875rem !important;
+            }
+        }
+
+        /* ------ M3: group-button active state ---------------------------------
+           Matches the .pin-btn.is-active convention -- reactive class flip when
+           table.groupBy() matches the button's target. */
+        .grp-btn.is-active {
+            background: var(--accent-2);
+            color: white;
+            border-color: var(--accent);
+        }
+
+        /* ------ M3: sticky group headers + grand total under dark theme -------
+           The library's default sticky styles use a light-blue tint (#eff6ff /
+           #f0f9ff) that reads clearly on the built-in white palette but nearly
+           vanishes on this dark background. We restyle both to a dark blue with
+           enough contrast against .lt-row-alt (#172033) that scrolling users
+           always know which row is a header vs a data row. */
+        .lt-row-group-header {
+            background: #1e3a5f !important;
+            border-bottom-color: #3b6ba5 !important;
+            color: #dbeafe !important;
+        }
+
+        .lt-row-group-header:hover {
+            background: #26497a !important;
+        }
+
+        .lt-row-group-header .lt-cell {
+            color: #dbeafe !important;
+        }
+
+        .lt-row-group-header .lt-cell:not(:first-child) {
+            color: #93c5fd !important;
+        }
+
+        .lt-row-grand-total {
+            background: #0c4a6e !important;
+            border-top: 2px solid #38bdf8 !important;
+            border-bottom-color: #38bdf8 !important;
+            color: #e0f2fe !important;
+        }
+
+        .lt-row-grand-total .lt-cell {
+            color: #e0f2fe !important;
+        }
+
+        /* Sticky rows inherit .lt-row-group-header / .lt-row-grand-total so the
+           above styles apply. The subtle shadow the library ships adds a
+           useful float cue against the darker data rows. */
+    </style>
 </head>
 <body>
 
 <header>
     <button class="drawer-toggle" id="drawer-toggle" aria-label="Open controls" aria-controls="sidebar">&#9776;</button>
     <h1>@zakkster/lite-table</h1>
-    <span class="sub">M2 preview &middot; <b id="stat-header-rows">0</b> rows &middot; sort &middot; filter &middot; edit &middot; resize &middot; reorder &middot; pin &middot; selection &middot; export</span>
+    <span class="sub">1.2.0 &middot; <b id="stat-header-rows">0</b> rows &middot; group &middot; aggregate &middot; sticky &middot; sort &middot; filter &middot; edit &middot; resize &middot; reorder &middot; pin &middot; select &middot; export</span>
 </header>
 
 <div class="backdrop" id="backdrop" aria-hidden="true"></div>
@@ -371,6 +563,32 @@
     </div>
 
     <div class="panel-group">
+        <h2>Group &amp; Aggregate</h2>
+        <!-- M3: groupBy is a Signal<string[]>, mutated via setGroupBy.
+             Buttons flip the current grouping; the "active" class is bound
+             reactively so external code paths (e.g. keyboard, script) that
+             call setGroupBy will still light the correct button. -->
+        <div class="row">
+            <button id="btn-group-none" class="grp-btn">None</button>
+            <button id="btn-group-status" class="grp-btn">By status</button>
+        </div>
+        <div class="row">
+            <button id="btn-group-region-status" class="grp-btn">Region &rarr; Status</button>
+        </div>
+        <div class="row">
+            <button id="btn-group-expand-all">Expand all</button>
+            <button id="btn-group-collapse-all">Collapse all</button>
+        </div>
+        <div class="sub" id="stat-group">group: none &middot; entries: 0 &middot; collapsed: 0</div>
+        <div class="kbd-help">
+            Click a <b>group header row</b> to collapse/expand its subtree.
+            Sticky group headers glue to the top as you scroll; the
+            <b>grand total</b> stays glued to the bottom. Value column
+            aggregates <code>sum</code>.
+        </div>
+    </div>
+
+    <div class="panel-group">
         <h2>Columns</h2>
         <div id="col-controls"></div>
         <div class="kbd-help">
@@ -409,7 +627,10 @@
             <b>Edit:</b> dblclick or <kbd>F2</kbd>/<kbd>Enter</kbd> &middot;
             <kbd>Enter</kbd> commit+down &middot;
             <kbd>Tab</kbd> commit+right &middot;
-            <kbd>Esc</kbd> cancel.
+            <kbd>Esc</kbd> cancel.<br>
+            <b>Group:</b> click a group-header row (inline or sticky) to
+            collapse/expand. Arrow keys skip over headers, staying inside
+            data rows.
         </div>
     </div>
 </aside>
@@ -418,6 +639,7 @@
 
 <footer>
     <span class="stat">Rows: <b id="stat-rows">0</b></span>
+    <span class="stat">Entries: <b id="stat-entries">0</b></span>
     <span class="stat">Pool: <b id="stat-pool">0</b></span>
     <span class="stat">Visible: <b id="stat-vis-start">0</b>&ndash;<b id="stat-vis-end">0</b></span>
     <span class="stat">Focus: <b id="stat-focus">none</b></span>
@@ -428,8 +650,9 @@
 <!--
     Importmap pinned to exact published versions so this demo is fully
     self-contained: open it from anywhere (any static server) and QA/review
-    can run it without a node_modules install. Update the lite-table version
-    after publish.
+    can run it without a node_modules install. `@zakkster/lite-table` points
+    to the local ../Table.js so this demo always exercises the working
+    source before publish. Update the substrate versions if any peer bumps.
 -->
 <script type="importmap">
 {
@@ -440,11 +663,12 @@
     "@zakkster/lite-table":      "../Table.js"
   }
 }
+
 </script>
 
 <script type="module">
-    import { signal, effect, createRegistry, setDefaultRegistry } from "@zakkster/lite-signal";
-    import { createTable, mountTable } from "@zakkster/lite-table";
+    import {signal, effect, createRegistry, setDefaultRegistry} from "@zakkster/lite-signal";
+    import {createTable, mountTable} from "@zakkster/lite-table";
 
     // The demo + table together can briefly peak past the default 1024-node
     // cap during mobile-preview resize storms (ResizeObserver fires N times,
@@ -458,10 +682,16 @@
 
     // ---- Data ----
     const STATUSES = ["active", "pending", "archived", "blocked"];
+    // M3: a coarse category field (5 buckets) that makes multi-level
+    // grouping visibly interesting. Distributing by (i % REGIONS.length)
+    // gives every region an equal share (20k rows each at N0 = 100k).
+    const REGIONS = ["Europe", "Asia", "Africa", "Americas", "Oceania"];
     const N0 = 100_000;
+
     function makeRow(i) {
         return {
             id: i,
+            region: REGIONS[i % REGIONS.length],
             name: "Row " + String(i).padStart(6, "0"),
             email: "user" + i + "@example.com",
             value: Math.round((Math.sin(i * 0.13) + 1) * 5000) / 10,
@@ -469,7 +699,8 @@
             createdAt: new Date(2024, 0, 1 + (i % 365)).toISOString().slice(0, 10)
         };
     }
-    const baseData = Array.from({ length: N0 }, (_, i) => makeRow(i));
+
+    const baseData = Array.from({length: N0}, (_, i) => makeRow(i));
     const rows = signal(baseData);
     const editCount = signal(0);
 
@@ -482,40 +713,79 @@
     //   editable: true   -- double-click / F2 starts cell edit
     //   filterable: true -- exposes a filter input in the filter row
     //   filter: (v,q)=>  -- custom filter predicate (default is substring)
+    //
+    // M3 opt-ins (per column):
+    //   aggregate: "sum" | "avg" | "min" | "max" | "count" | fn
+    //   aggregateFormat: (value, col, count) => string  -- display-only
+    //
+    // The `value` column carries the primary numeric aggregate (sum with
+    // dollar formatting). The `id` column uses `count` so group headers
+    // and the grand total show the row count in the ID slot as well as
+    // in the first-cell label. Together the two aggregates demonstrate
+    // that non-first-cell aggregates render right-aligned with tabular
+    // numerics, and that the raw value is preserved (see the raw fetch
+    // in the "Copy raw" export path).
     const COLS = [
-        { key: "id",        header: "ID",      width: 90,  minWidth: 60 },
-        { key: "name",      header: "Name",    width: 180, minWidth: 120, flex: 1,
-          editable: true, filterable: true },
-        { key: "email",     header: "Email",   width: 240, minWidth: 180, flex: 2,
-          editable: true, filterable: true },
-        { key: "value",     header: "Value",   width: 100, compare: (a, b) => a - b,
-          editable: true, filterable: true,
-          // Custom filter: ">N" / "<N" / exact number / substring fallback.
-          filter: (v, q) => {
-              const t = q.trim();
-              if (!t) return true;
-              if (t.startsWith(">")) {
-                  const n = Number(t.slice(1));
-                  return Number.isFinite(n) && v > n;
-              }
-              if (t.startsWith("<")) {
-                  const n = Number(t.slice(1));
-                  return Number.isFinite(n) && v < n;
-              }
-              const n = Number(t);
-              if (Number.isFinite(n)) return v === n;
-              return String(v).indexOf(t) >= 0;
-          },
-          filterPlaceholder: ">500 / <100 / 42" },
-        { key: "status",    header: "Status",  width: 110,
-          editable: true, filterable: true },
-        { key: "createdAt", header: "Created", width: 130,
-          editable: true, filterable: true }
+        {
+            key: "id", header: "ID", width: 90, minWidth: 60,
+            aggregate: "count",
+            aggregateFormat: (v) => v + " rows"
+        },
+        {
+            key: "region", header: "Region", width: 110,
+            filterable: true
+        },
+        {
+            key: "name", header: "Name", width: 180, minWidth: 120, flex: 1,
+            editable: true, filterable: true
+        },
+        {
+            key: "email", header: "Email", width: 240, minWidth: 180, flex: 2,
+            editable: true, filterable: true
+        },
+        {
+            key: "value", header: "Value", width: 150, minWidth: 100, compare: (a, b) => a - b,
+            editable: true, filterable: true,
+            aggregate: "sum",
+            aggregateFormat: (v) =>
+                "$" + v.toLocaleString("en-US", {maximumFractionDigits: 0}),
+            // Custom filter: ">N" / "<N" / exact number / substring fallback.
+            filter: (v, q) => {
+                const t = q.trim();
+                if (!t) return true;
+                if (t.startsWith(">")) {
+                    const n = Number(t.slice(1));
+                    return Number.isFinite(n) && v > n;
+                }
+                if (t.startsWith("<")) {
+                    const n = Number(t.slice(1));
+                    return Number.isFinite(n) && v < n;
+                }
+                const n = Number(t);
+                if (Number.isFinite(n)) return v === n;
+                return String(v).indexOf(t) >= 0;
+            },
+            filterPlaceholder: ">500 / <100 / 42"
+        },
+        {
+            key: "status", header: "Status", width: 110,
+            editable: true, filterable: true
+        },
+        {
+            key: "createdAt", header: "Created", width: 130,
+            editable: true, filterable: true
+        }
     ];
 
     const table = createTable({
         rows, columns: COLS, getRowId: (r) => r.id,
         rowHeight: 32, overscan: 4,
+
+        // M3: grand total row pinned at the tail. Reactive -- when a filter
+        // narrows the data set, the grand total recomputes over the
+        // filteredRows, so the "$X,XXX" in the sticky footer always
+        // reflects what the user is looking at.
+        showGrandTotal: true,
 
         // M2: commit hook. lite-table never mutates rows itself -- the
         // consumer is responsible for the write. The handler receives
@@ -529,7 +799,7 @@
         // itself this is technically redundant (the manual bindText effect
         // re-runs when editingCell clears), but computed columns reading the
         // mutated field need this nudge.
-        onCellEdit: ({ row, columnKey, newValue }) => {
+        onCellEdit: ({row, columnKey, newValue}) => {
             // newValue is always a string (it came from contenteditable).
             // Coerce to the column's domain type before writing.
             if (columnKey === "value") {
@@ -551,12 +821,24 @@
     // ---- Live stats ----
     const $ = (id) => document.getElementById(id);
     $("stat-pool").textContent = mount.poolSize();
-    effect(() => { $("stat-vis-start").textContent = mount.axis.start(); });
-    effect(() => { $("stat-vis-end").textContent = mount.axis.end(); });
+    effect(() => {
+        $("stat-vis-start").textContent = mount.axis.start();
+    });
+    effect(() => {
+        $("stat-vis-end").textContent = mount.axis.end();
+    });
     effect(() => {
         const n = table.rowCount().toLocaleString();
         $("stat-rows").textContent = n;
         $("stat-header-rows").textContent = n;
+    });
+    // M3: entryCount is data rows + group headers + grand-total (if any).
+    // It drives the virtual axis; showing it alongside `rows` makes the
+    // grouping overhead visible at a glance (e.g. 100k rows -> 100,005
+    // entries when grouped by status + grand-total, i.e. 4 headers + 1
+    // grand-total).
+    effect(() => {
+        $("stat-entries").textContent = table.entryCount().toLocaleString();
     });
     effect(() => {
         const f = table.focusedCell();
@@ -574,7 +856,9 @@
         const sortStr = chain.length === 0 ? "none" : chain.map((e) => e.key + " " + e.dir).join(", ");
         $("stat-sort-filter").textContent = "sort: " + sortStr + " \u00b7 filters: " + filters;
     });
-    effect(() => { $("stat-edits").textContent = editCount(); });
+    effect(() => {
+        $("stat-edits").textContent = editCount();
+    });
 
     // ---- Scroll buttons ----
     $("btn-top").onclick = () => mount.scrollToIndex(0);
@@ -588,10 +872,10 @@
     // ---- Data ops ----
     $("btn-mutate").onclick = () => {
         const arr = rows.peek().slice();
-        arr[42] = { ...arr[42], name: "MUTATED @ " + new Date().toLocaleTimeString(), value: 999.9 };
+        arr[42] = {...arr[42], name: "MUTATED @ " + new Date().toLocaleTimeString(), value: 999.9};
         rows.set(arr);
         mount.scrollToIndex(42, "center");
-        table.focusedCell.set({ rowId: 42, columnKey: "name" });
+        table.focusedCell.set({rowId: 42, columnKey: "name"});
     };
     $("btn-filter").onclick = () => {
         rows.set(baseData.filter((r) => r.id % 2 === 0));
@@ -610,6 +894,10 @@
         table.clearSelection();
         table.clearSort();
         table.clearColumnFilters();
+        // M3: also clear grouping + collapsed set so Reset is truly a
+        // return-to-defaults, not just a filter-and-sort clear.
+        table.setGroupBy(null);
+        table.expandAllGroups();
         editCount.set(0);
         for (const c of table.columns) {
             c.hidden.set(false);
@@ -633,13 +921,60 @@
         mount.scrollToIndex(0);
     };
 
+    // ---- M3: Group & Aggregate ----
+    // The three groupBy targets map cleanly onto the interesting shapes:
+    //   none          -> ungrouped fast path (visibleEntries == data + gt)
+    //   "status"      -> single-level, four groups (~25k rows each)
+    //   region+status -> two-level, 5 x 4 = 20 leaf groups (~5k rows each)
+    // Each button also scrolls to the top so the newly-emitted group
+    // headers are immediately visible.
+    const GROUP_TARGETS = {
+        "btn-group-none": [],
+        "btn-group-status": ["status"],
+        "btn-group-region-status": ["region", "status"]
+    };
+    for (const [btnId, target] of Object.entries(GROUP_TARGETS)) {
+        $(btnId).onclick = () => {
+            table.setGroupBy(target.length === 0 ? null : target);
+            mount.scrollToIndex(0);
+        };
+    }
+    // Reactive active-button highlight -- shows the currently-applied
+    // grouping regardless of who called setGroupBy (button vs script vs
+    // future URL-restore hook).
+    effect(() => {
+        const gb = table.groupBy();
+        const key = gb.length === 0 ? "btn-group-none"
+            : gb.length === 1 && gb[0] === "status" ? "btn-group-status"
+                : gb.length === 2 && gb[0] === "region" && gb[1] === "status"
+                    ? "btn-group-region-status"
+                    : null;
+        for (const bid of Object.keys(GROUP_TARGETS)) {
+            $(bid).classList.toggle("is-active", bid === key);
+        }
+    });
+    $("btn-group-expand-all").onclick = () => table.expandAllGroups();
+    $("btn-group-collapse-all").onclick = () => table.collapseAllGroups();
+    // Combined status line: current grouping + how many entries + how many
+    // groups are collapsed. When there's no grouping, entries == rows (+1
+    // for the grand total) and collapsed is always 0 (nothing to collapse).
+    effect(() => {
+        const gb = table.groupBy();
+        const gbStr = gb.length === 0 ? "none" : gb.join(" \u2192 ");
+        const entries = table.entryCount().toLocaleString();
+        const collapsed = table.collapsedGroups().size;
+        $("stat-group").textContent =
+            "group: " + gbStr + " \u00b7 entries: " + entries +
+            " \u00b7 collapsed: " + collapsed;
+    });
+
     // ---- Selection ----
     $("btn-select-all").onclick = () => table.selectAll();
     $("btn-clear-sel").onclick = () => table.clearSelection();
 
     // ---- Export ----
     function downloadFile(text, filename, mime) {
-        const blob = new Blob([text], { type: mime });
+        const blob = new Blob([text], {type: mime});
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
@@ -649,18 +984,19 @@
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
     }
+
     $("btn-export-csv").onclick = () => {
         // "visible" respects the current filter + sort -- exactly what the user sees.
-        const csv = table.exportCsv({ rows: "visible", bom: true });
+        const csv = table.exportCsv({rows: "visible", bom: true});
         downloadFile(csv, "lite-table-visible.csv", "text/csv;charset=utf-8");
     };
     $("btn-export-csv-sel").onclick = () => {
         // For "Select all" we want the FULL master, not just current page.
-        const csv = table.exportCsv({ rows: table.selectedRows(baseData), bom: true });
+        const csv = table.exportCsv({rows: table.selectedRows(baseData), bom: true});
         downloadFile(csv, "lite-table-selected.csv", "text/csv;charset=utf-8");
     };
     $("btn-export-json").onclick = () => {
-        const json = table.exportJson({ rows: baseData, columns: "all", indent: 2 });
+        const json = table.exportJson({rows: baseData, columns: "all", indent: 2});
         downloadFile(json, "lite-table-all.json", "application/json;charset=utf-8");
     };
 
@@ -679,7 +1015,9 @@
         cb.checked = !col.hidden.peek();
         cb.title = "Show/hide " + col.header;
         cb.onchange = () => col.hidden.set(!cb.checked);
-        effect(() => { cb.checked = !col.hidden(); });
+        effect(() => {
+            cb.checked = !col.hidden();
+        });
 
         const label = document.createElement("span");
         label.className = "col-name";
@@ -709,9 +1047,9 @@
         };
 
         pinLine.append(
-            makePinBtn("left",  "L",   "Pin " + col.header + " to left edge"),
-            makePinBtn("none",  "off", "Unpin " + col.header),
-            makePinBtn("right", "R",   "Pin " + col.header + " to right edge")
+            makePinBtn("left", "L", "Pin " + col.header + " to left edge"),
+            makePinBtn("none", "off", "Unpin " + col.header),
+            makePinBtn("right", "R", "Pin " + col.header + " to right edge")
         );
 
         row.append(nameLine, pinLine);
@@ -735,7 +1073,7 @@
     mount.root.focus();
 
     // Expose for QA / browser tests if anyone wants to poke at the live state.
-    window.__demo = { table, mount, rows, baseData, editCount };
+    window.__demo = {table, mount, rows, baseData, editCount};
     window.__demoReady = true;
 </script>
 </body>

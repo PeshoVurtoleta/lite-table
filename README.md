@@ -52,6 +52,7 @@ Synchronous, virtual, allocation-free in the steady state. A 100,000-row scroll 
 - [Export](#export)
 - [Cell editing](#cell-editing)
 - [Per-column filtering](#per-column-filtering)
+- [Grouping and aggregation](#grouping-and-aggregation)
 - [Pinning and sticky offsets](#pinning-and-sticky-offsets)
 - [Flex columns](#flex-columns)
 - [Sorting](#sorting)
@@ -100,9 +101,9 @@ No microtask between `A` and `H`. No reconciliation. No diffing. Just version-st
 
 - **`createTable(config)`** -- headless `TableCore`. Reactive columns, visible rows, sort, selection, focused cell. Pure data, no DOM.
 - **`mountTable(host, table, options?)`** -- DOM mount. Builds a fixed slot pool, header bar, viewport, attaches all reactive bindings, returns `{ root, dispose }`.
-- **`createTable` accepts** rows (array or getter), columns, `getRowId`, `rowHeight`, `overscan`, `initialFocus`, `initialSort`.
-- **Reactive surface:** `visibleRows`, `rowCount`, `visibleColumns`, `displayIndexByKey`, `colTemplate`, `colPlacement`, `contentWidth`, `leftOffsets`, `rightOffsets`, `sortChain`, `focusedCell`, `selection`, `selectionAnchor`.
-- **Methods:** `setSort`, `addSort`, `toggleSort`, `clearSort`, `setColumnWidth`, `setColumnHidden`, `setColumnPin`, `setColumnFlex`, `setColumnOrder`, `moveColumn`, `selectRow`, `selectRowRange`, `selectAll`, `clearSelection`, `isSelected`, `moveFocus`, `cellId`, `dispose`.
+- **`createTable` accepts** rows (array or getter), columns, `getRowId`, `rowHeight`, `overscan`, `initialFocus`, `initialSort`, `onCellEdit`, `groupBy`, `initialCollapsedGroups`, `showGrandTotal`.
+- **Reactive surface:** `visibleRows`, `rowCount`, `filteredRows`, `visibleColumns`, `displayIndexByKey`, `colTemplate`, `colPlacement`, `contentWidth`, `leftOffsets`, `rightOffsets`, `sortChain`, `columnFilters`, `focusedCell`, `selection`, `selectionAnchor`, `editingCell`, `editingDraft`, `groupBy`, `collapsedGroups`, `groupedRows`, `visibleEntries`, `entryCount`.
+- **Methods:** `setSort`, `addSort`, `toggleSort`, `clearSort`, `setColumnWidth`, `setColumnHidden`, `setColumnPin`, `setColumnFlex`, `setColumnOrder`, `moveColumn`, `setColumnFilter`, `clearColumnFilters`, `startEdit`, `commitEdit`, `cancelEdit`, `isEditing`, `exportCsv`, `exportJson`, `setGroupBy`, `toggleGroup`, `expandGroup`, `collapseGroup`, `expandAllGroups`, `collapseAllGroups`, `isGroupCollapsed`, `groupAncestryAt`, `selectRow`, `selectRowRange`, `selectAll`, `clearSelection`, `isSelected`, `moveFocus`, `cellId`, `dispose`.
 - **Per-column state:** every `ColumnState` exposes `width`, `hidden`, `pin`, `flex` as signals -- wire them directly to your own UI controls.
 
 Full type definitions ship in [`Table.d.ts`](./Table.d.ts) and are referenced from `package.json`. Every public symbol has JSDoc.
@@ -246,10 +247,18 @@ const table = createTable({
   rows: Row[] | (() => Row[]),
   columns: ColumnDef[],
   getRowId: (row: Row) => string | number,
-  rowHeight?: number,         // default 32
-  overscan?: number,          // default 4
+  rowHeight?: number,                      // default 32
+  overscan?: number,                       // default 4
   initialFocus?: CellId | null,
-  initialSort?: SortEntry[]
+  initialSort?: SortEntry[],
+
+  // M2 -- editing
+  onCellEdit?: ({ row, columnKey, oldValue, newValue }) => void | Promise<any>,
+
+  // M3 -- grouping + aggregation
+  groupBy?: string | string[] | null,     // default null (ungrouped fast path)
+  initialCollapsedGroups?: string[][],    // e.g. [["Europe"], ["Asia","Books"]]
+  showGrandTotal?: boolean                // default false
 });
 ```
 
@@ -289,6 +298,17 @@ interface ColumnDef {
   reorderable?: boolean;               // default true
   accessor?: (row) => any;             // default row[key]
   compare?: (a, b) => number;          // default null-safe numeric/string
+
+  // M2
+  editable?: boolean;                                              // opt-in for cell editing
+  filterable?: boolean;                                            // opt-in for per-column filter
+  filter?: (value, query, row) => boolean;                         // custom filter predicate
+  filterPlaceholder?: string;                                      // default "Filter…"
+
+  // M3
+  aggregate?: "sum" | "avg" | "min" | "max" | "count"              // reducer for group + total cells
+             | ((rows, col) => any) | null;
+  aggregateFormat?: (value, col, count) => string;                 // display formatter (raw stays available)
 }
 ```
 
@@ -324,8 +344,9 @@ These are live signals. `column.width.set(160)` updates the CSS template, the st
 ```ts
 table.columns              // ColumnState[]
 table.rowsGetter()         // current row source
-table.visibleRows()        // Computed<Row[]>  -- sort applied
-table.rowCount()           // Computed<number>
+table.visibleRows()        // Computed<Row[]>  -- sort applied, data-only
+table.rowCount()           // Computed<number> -- data-only
+table.filteredRows()       // Computed<Row[]>  -- post-filter, pre-sort (M2)
 table.columnOrder()        // Signal<string[]>
 table.visibleColumns()     // Computed<ColumnState[]>
 table.displayIndexByKey()  // Computed<Map<key, 0-indexed display pos>>
@@ -335,9 +356,20 @@ table.contentWidth()       // Computed<number>   -- sum of widths
 table.leftOffsets()        // Computed<Map<key, cumulative left px>>
 table.rightOffsets()       // Computed<Map<key, cumulative right px>>
 table.sortChain()          // Signal<SortEntry[]>
+table.columnFilters()      // Signal<ReadonlyMap<key, query>> (M2)
 table.focusedCell()        // Signal<CellId | null>
-table.selection()          // Signal<Set<RowId>>
+table.selection()          // Signal<{mode, set}> -- predicate, not a list
 table.selectionAnchor()    // Signal<RowId | null>
+table.selectedCount()      // Computed<number>  -- reactive O(1)
+table.editingCell()        // Signal<{rowId, columnKey} | null> (M2)
+table.editingDraft()       // Signal<string> (M2)
+
+// M3: grouping + aggregation
+table.groupBy()            // Signal<string[]>  -- current group keys ([] = ungrouped)
+table.collapsedGroups()    // Signal<Set<string>> -- path-strings (U+001F separator)
+table.groupedRows()        // Computed<GroupNode[] | null> -- null when ungrouped
+table.visibleEntries()     // Computed<Entry[]> -- data + group-headers + grand-total interleaved
+table.entryCount()         // Computed<number>  -- length of visibleEntries; drives the axis
 ```
 
 All `()` calls are tracked reads -- `effect(() => log(table.rowCount()))` will re-run whenever the row source changes.
@@ -388,6 +420,16 @@ table.editingDraft()                      // current in-progress string
 // Export (M1.1)
 table.exportCsv({ rows?, columns?, delimiter?, quote?, headers?, newline?, bom?, formatter? })   // → string
 table.exportJson({ rows?, columns?, indent?, format?, formatter? })                              // → string | object[]
+
+// Grouping + aggregation (M3)
+table.setGroupBy(v)                       // string | string[] | null; unknown keys dropped
+table.toggleGroup(path)                   // flip collapsed for one group path
+table.expandGroup(path)                   // no-op if already expanded
+table.collapseGroup(path)                 // no-op if already collapsed
+table.expandAllGroups()                   // clears collapsed set
+table.collapseAllGroups()                 // walks groupedRows() once
+table.isGroupCollapsed(path)              // O(1) predicate
+table.groupAncestryAt(entryIndex)         // GroupHeaderEntry[] -- for sticky headers
 
 // Lifecycle
 table.dispose()
@@ -650,6 +692,161 @@ The fast path returns the source array identity when no filter is active, so jus
 
 ---
 
+## Grouping and aggregation
+
+Group rows by one or more column keys and fold per-group aggregates. Group headers are pool slots like any other row -- same reactive rendering path, same zero-GC scroll math. There are no extra DOM primitives: a group header IS a `.lt-row` with a discriminator class.
+
+```js
+import { createTable, mountTable } from "@zakkster/lite-table";
+
+const table = createTable({
+    rows,
+    columns: [
+        { key: "id",     width: 80 },
+        { key: "region", width: 120 },
+        { key: "status", width: 120 },
+        { key: "value",  width: 140, compare: (a, b) => a - b,
+          aggregate: "sum",
+          aggregateFormat: (v) => "$" + v.toFixed(0) }
+    ],
+    getRowId: r => r.id,
+    groupBy: ["region", "status"],       // multi-level
+    showGrandTotal: true                  // pinned "Total (N)" entry at tail
+});
+mountTable(host, table);
+```
+
+Clicking a group header row toggles its collapse; a chevron in the first cell flips between `▼` and `▶`. Aggregates render in the columns that declared an `aggregate` -- other columns stay blank on header rows.
+
+### The pipeline
+
+```
+rowsGetter -> filteredRows -> groupedRows -> visibleEntries -> visibleRows
+                                    │             │
+                                    │             └── pool slots + sticky headers
+                                    └── sort applies WITHIN each leaf group
+```
+
+- Filter runs BEFORE grouping. Empty groups vanish -- no dead headers.
+- Sort chain applies WITHIN leaves. Groups themselves are ordered by group key ascending; `null` values bucket last.
+- Aggregates always fold over leaf rows at every depth. That's the safe default for reducers that don't compose (median, last-value-wins, `distinct-count`). Sum/avg/min/max/count don't care; you can supply a custom reducer if you have one that needs different semantics.
+
+### Column config
+
+| Field             | Type                                       | Purpose                                                                     |
+| ----------------- | ------------------------------------------ | --------------------------------------------------------------------------- |
+| `aggregate`       | `"sum" \| "avg" \| "min" \| "max" \| "count"` or `(rows, col) => any` | The reducer. Nullish values are skipped for `sum`/`avg`/`min`/`max`; `count` counts rows unconditionally. Custom function receives the leaf-row array. |
+| `aggregateFormat` | `(value, col, count) => string`            | Display formatter for header + grand-total cells. `entry.aggregates.get(key)` still returns the raw so exports stay authoritative. Errors caught + logged. |
+
+### createTable config
+
+| Field                    | Type                                | Default |
+| ------------------------ | ----------------------------------- | ------- |
+| `groupBy`                | `string \| string[] \| null`        | `null`  |
+| `initialCollapsedGroups` | `string[][]`                        | `[]`    |
+| `showGrandTotal`         | `boolean`                           | `false` |
+
+Unknown keys in `groupBy` are silently dropped, so persisted state that outlives a column config survives without crashes.
+
+### Reactive surface
+
+```js
+table.groupBy()                    // Signal<string[]>
+table.collapsedGroups()            // Signal<Set<string>>  — path strings
+table.groupedRows()                // Computed<GroupNode[] | null>  — null when ungrouped
+table.visibleEntries()             // Computed<Entry[]>    — interleaved for rendering
+table.entryCount()                 // Computed<number>     — drives the virtual axis
+table.visibleRows()                // Computed<Row[]>      — data-only; unchanged 1.1.0 contract
+table.rowCount()                   // Computed<number>     — data-only; unchanged
+```
+
+An `Entry` is one of:
+
+```
+{ type: "data",         row }
+{ type: "group-header", depth, key, value, path, pathStr, count, aggregates, isCollapsed }
+{ type: "grand-total",  aggregates, count }
+```
+
+`path` is the array of ancestor group values (e.g., `["Europe", "Books"]`); `pathStr` is the U+001F-separated form used as the collapsed-set key. The mount layer dispatches per-slot rendering on `entry.type`; consumers driving their own renderer do the same.
+
+### Methods
+
+```js
+table.setGroupBy(key | keys | null)      // idempotent; unknown keys dropped
+table.toggleGroup(path)
+table.expandGroup(path)
+table.collapseGroup(path)
+table.expandAllGroups()
+table.collapseAllGroups()                 // walks groupedRows() once
+table.isGroupCollapsed(path)              // O(1) predicate
+table.groupAncestryAt(entryIndex)         // for sticky group headers
+```
+
+### Ungrouped fast path
+
+When `groupBy()` is empty, `groupedRows` short-circuits to `null` and `visibleRows` returns the sort-applied rows directly -- byte-identical to 1.1.0 behavior. Non-grouping tables pay one signal read and nothing else.
+
+### Sticky group headers + grand total
+
+Both are built in. Sticky group headers glue below the column header and reactively track the active ancestor group at every depth level as the user scrolls -- click one to collapse its subtree. Sticky grand total glues to the bottom of the viewport whenever `showGrandTotal: true`.
+
+Under the hood, both are `position: sticky` zero-height containers with absolute-positioned rows -- they don't reserve scroll space and don't interfere with pool math. They render only when needed (no sticky container when ungrouped; no footer when grand total isn't configured). Nothing to opt into and nothing to opt out of.
+
+The sticky ancestor lookup uses `axis.firstIndex()` (not `axis.start()`) so sticky matches what's under the column-header line -- `start` includes overscan slots above the viewport and would show ancestors of a not-yet-visible entry.
+
+If you need a custom sticky design (e.g. a breadcrumb variant, a different offset for an app-level top bar), hide the built-ins with `display: none` on `.lt-sticky-groups` / `.lt-sticky-grand-total` and rebuild the same in ~20 lines using the exposed primitive:
+
+```js
+import { effect } from "@zakkster/lite-signal";
+
+effect(() => {
+    const ancestors = table.groupAncestryAt(mount.axis.firstIndex());
+    // render `ancestors` however you like -- click each to toggleGroup(a.path)
+});
+```
+
+### Rendered DOM
+
+Group headers render as:
+
+```html
+<div class="lt-row lt-row-group-header" data-depth="N" data-collapsed="true|false">
+    <div class="lt-cell" data-key="…">▼  Asia  (100)</div>
+    <div class="lt-cell" data-key="…"></div>
+    <div class="lt-cell" data-key="…">$5,092</div>
+    ...
+</div>
+```
+
+One cell per column matching the data-row grid template. The first visible cell holds the chevron + value + count; other cells hold their column's aggregate (or empty if the column has no aggregate). Aggregate cells right-align with tabular-numerics for column alignment across headers.
+
+Grand-total rows use `<div class="lt-row lt-row-grand-total">` with the same cell structure; the first cell reads `Total (N)`.
+
+Sticky group headers live in `<div class="lt-sticky-groups">` -- a direct child of `.lt-viewport`, before `.lt-inner`. Each depth's row also carries `.lt-sticky-group` so you can restyle them independently of pool-rendered headers. Sticky grand total lives in `<div class="lt-sticky-grand-total">` (after `.lt-inner`) with a `.lt-sticky-grand-total-row` inside. Sticky rows do NOT carry the base `.lt-row` class so `querySelectorAll(".lt-row")` still counts only pool slots.
+
+### Interaction
+
+- **Click on a group-header cell** (inline or sticky) toggles the group's collapse.
+- **Click on a grand-total row** is ignored (no selection change, no side effect).
+- **Selection / edit / focus** are gated on `entry.type === "data"`. Clicking a header doesn't clear the row selection, editable cells stay non-editing on headers, and arrow-key focus moves stay inside data rows.
+
+### Performance notes
+
+- Grouping is O(N) per rebuild (walk + bucket + per-leaf sort). Rebuilds fire on `filteredRows()`, `sortChain()`, or `groupBy()` changes -- never on scroll.
+- Aggregates fold once per rebuild. For deep trees this dominates; a 100k-row / 3-level table with 4 aggregates folds in a few ms.
+- Scroll cost stays at 1 transform write per pool slot per boundary cross, unchanged from 1.1.0. `axis.setCount(entryCount())` bumps when collapse changes -- boundary math re-derives on the next frame.
+- Signal-node overhead: adding `aggregate` to a column costs one entry in a Map. Adding `groupBy` costs one extra computed per slot (`slotEntry`) beyond the 1.1.0 per-cell effects. For the recommended 6-col / 24-slot table, expect ~950 nodes with aggregates + grouping enabled -- still under the default 1024 registry cap. Bump the cap explicitly for larger footprints:
+
+```js
+import { createRegistry, setDefaultRegistry } from "@zakkster/lite-signal";
+setDefaultRegistry(createRegistry({ initialNodes: 4096 }));
+```
+
+Verified zero-GC: 10,000 boundary scrolls across a 100,000-row grouped view with sticky overlays active produces signal-node delta 0, pool delta 0. See `bench/03-heap-grouped.js`.
+
+---
+
 ## Pinning and sticky offsets
 
 Pinned columns use `position: sticky` with cumulative offsets. The math is:
@@ -820,13 +1017,14 @@ setDefaultRegistry(createRegistry({
 
 ## Benchmarks
 
-Four benchmarks, all in `bench/`:
+Five benchmarks, all in `bench/`:
 
 | Bench                              | Measures                                                    |
 | ---------------------------------- | ----------------------------------------------------------- |
 | `01-scroll-writes.js`              | DOM allocations vs in-place updates per scroll boundary cross, against clusterize.js + a naive virtual implementation |
 | `02-mount.js`                      | Time to first paint at 1k / 10k / 100k / 1M rows            |
-| `03-heap.js`                       | Steady-state heap delta + signal-node growth across 10k boundary scrolls |
+| `03-heap.js`                       | Steady-state heap delta + signal-node growth across 10k boundary scrolls (ungrouped) |
+| `03-heap-grouped.js`               | Same shape as `03-heap.js` but with `groupBy: "status"` + `showGrandTotal: true` + sticky overlays active |
 | `04-sort.js`                       | 100k-row sort + cached re-read + toggle cycle               |
 
 Representative numbers on a 2016 MacBook (your hardware will be different; relative ordering is what matters):
@@ -872,7 +1070,7 @@ Two tiers, all reproducible.
 
 ### Tier 1 -- Behavior (unit tests, fast)
 
-`npm test` runs the suite in `test/`, 110 tests across 9 files:
+`npm test` runs the suite in `test/`, **257 tests across 14 files**:
 
 - **`core.test.js`** -- `createTable` API surface, reactive `visibleColumns`, `colTemplate`, `colPlacement` consistency under hide/pin/reorder, sort chain semantics, dispose idempotency.
 - **`dom.test.js`** -- `mountTable` produces correct DOM structure, header cells, slot pool sized to viewport, ARIA roles + indices, `aria-activedescendant` updates on focus moves, dispose tears down all bindings.
@@ -883,6 +1081,11 @@ Two tiers, all reproducible.
 - **`columns.test.js`** -- `setColumnWidth` clamping, `setColumnHidden`, `setColumnPin`, `setColumnFlex` and the **pinning-suspends-flex** invariant (regression for the offset-vs-rendered-width mismatch), `moveColumn` cases, `colTemplate` segment count consistency with `colPlacement`.
 - **`keyboard.test.js`** -- `moveFocus` arrow / Home / End / PageUp / PageDown, focus clamps at edges, focus survives row reorder.
 - **`extras.test.js`** -- `scrollToIndex` × 3 align modes, pointer-driven column resize + reorder, `injectStyles:false`, mount-disposes-table lifecycle, null / zero / string-ID cells, `addSort(null)` removal, `moveFocus` from null focus, 50-column stress, steady-state graph stability under 1000 sort flips + 1000 selection toggles + 500 resize ops.
+- **`export.test.js`** -- RFC-4180 escaping, all option combinations, edge cases including 10k-row dataset finishing < 500ms (M1.1).
+- **`scope-dispose.test.js`** -- the M1.1 dispose-leak fix, dispose idempotency, 50-cycle round trip.
+- **`m2.test.js`** -- filtering basics, case insensitivity, multi-column AND, custom predicates, predicate receiving the full row, filter+sort interaction, filter+export, null/undefined handling, edit state transitions, all startEdit/commitEdit/cancelEdit semantics, onCellEdit handler error containment, edit+filter interaction, edit+dispose, numeric column unchanged-guard.
+- **`grouping.test.js`** (new in 1.2.0) -- config parsing, tree structure (single- and multi-level), aggregate types with null handling and custom-function support, leaf-fold correctness, `visibleEntries` interleave, backwards compat with the ungrouped fast path, sort within groups, filter-then-group interaction, collapse/expand/all, grand-total stability across collapse, `groupAncestryAt`, reactive propagation via signal-backed rows, edge cases.
+- **`grouping.dom.test.js`** (new in 1.2.0) -- row classes, first-cell chevron+count, aggregate cell rendering, click-to-toggle, click preserves selection, grand-total class + content, chevron flip via `data-collapsed`, `entryCount` drives virtual axis, data-row selection interleaved with headers, collapse hides data rows immediately, dispose cleanup, sticky containers in the correct viewport slots, sticky hidden when ungrouped, sticky grand-total hidden when unconfigured, hiding the first column shifts chevron to the next, column reorder keeps sticky + pool aligned, filter-row + grouping coexist.
 
 ```bash
 npm test
@@ -890,19 +1093,20 @@ npm test
 
 ### Tier 2 -- Memory (zero-GC verification)
 
-The `03-heap.js` bench is the production-style memory invariant: 10,000 boundary scrolls, 100,000 rows, must show **zero signal-node growth, zero link growth, zero pool growth**, and a heap delta inside V8's noise floor.
+The `03-heap.js` bench is the production-style memory invariant: 10,000 boundary scrolls, 100,000 rows, must show **zero signal-node growth, zero link growth, zero pool growth**, and a heap delta inside V8's noise floor. `03-heap-grouped.js` is the same invariant for a grouped view with sticky overlays active.
 
 ```bash
 node --expose-gc bench/03-heap.js
+node --expose-gc bench/03-heap-grouped.js
 ```
 
-If this fails, something allocates in the hot scroll path and we want to find it before publish.
+If either fails, something allocates in the hot scroll path and we want to find it before publish.
 
 ---
 
 ## What this is not
 
-- **A general-purpose grid component.** No cell editing yet, no row groups, no aggregations, no in-place pagination. The headless core makes those buildable on top, but they're not in the box.
+- **A general-purpose grid component.** No in-place pagination. The headless core makes it buildable on top, but it's not in the box.
 - **A perfect fit for every workload.** For a 50-row, no-virtualization-needed table, the slot pool is over-engineering -- a plain `<table>` is simpler and just as fast. `lite-table` shines starting at ~1,000 rows or when the columns and rows are independently reactive.
 - **A renderer.** It owns the DOM topology and the bindings between reactive sources and DOM properties. It does not own your row data, your filtering pipeline, or your data fetching.
 - **A library for the server.** It works in Node under `happy-dom` for tests, but there's no SSR story. Use it on the client.
@@ -921,7 +1125,7 @@ Built on the `@zakkster/lite-*` zero-GC ESM family. All MIT.
 **Helpers**
 - [`@zakkster/lite-persist`](https://www.npmjs.com/package/@zakkster/lite-persist) -- drop-in localStorage / IndexedDB / file persistence for `Signal` and `Computed`. Use it for column-state, sort, and selection persistence across sessions.
 
-The package tree is intentionally small. `lite-table` itself is a single file ESM module (~1300 lines including types-in-JSDoc), zero runtime dependencies beyond the three substrate packages.
+The package tree is intentionally small. `lite-table` itself is a single file ESM module (~3100 lines including types-in-JSDoc and inline design commentary), zero runtime dependencies beyond the three substrate packages.
 
 ---
 
@@ -1123,9 +1327,9 @@ Two patterns. Either render a checkbox character in the cell's `accessor` (`acce
 ## npm scripts
 
 ```bash
-npm test           # 110 tests across 9 files (node:test, --expose-gc)
+npm test           # 257 tests across 14 files (node:test, --expose-gc)
 npm run demo       # zero-dep static server on http://localhost:8080
-npm run bench      # all four benches sequentially (output: text or --md)
+npm run bench      # all five benches sequentially (output: text or --md)
 ```
 
 To run a single bench, invoke it directly:
@@ -1134,6 +1338,7 @@ To run a single bench, invoke it directly:
 node --expose-gc bench/01-scroll-writes.js
 node --expose-gc bench/02-mount.js
 node --expose-gc bench/03-heap.js
+node --expose-gc bench/03-heap-grouped.js
 node --expose-gc bench/04-sort.js
 ```
 

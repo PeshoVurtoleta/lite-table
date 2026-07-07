@@ -3,6 +3,17 @@
 Headless reactive data tables. CSS Grid. Zero-GC scrolling. Built on
 @zakkster/lite-signal, @zakkster/lite-virtual, @zakkster/lite-signal-dom.
 
+Feature milestones:
+  M1  (v1.0) headless core + DOM mount, virtualized rows on pooled slots,
+             sort, selection, resize, reorder, pin, flex.
+  M1.1 (v1.1) export (CSV / JSON), scope-dispose leak fix, sort-chain UX.
+  M2  (v1.1) cell editing, per-column filtering.
+  M3  (v1.2) row grouping (multi-level), per-column aggregation, sticky
+             group headers, sticky grand total.
+
+All feature additions are opt-in; the ungrouped / non-editing / non-filtering
+fast path is bit-identical to v1.0.
+
 ## Architecture invariants
 
 - No <table>. CSS Grid layout. role=grid / row / columnheader / gridcell.
@@ -222,6 +233,115 @@ TableCore editing (M2):
   Edit state survives scroll: keyed on rowId, so contenteditable rebinds
   when the row scrolls back into view. Draft preserved across scroll.
 
+TableCore grouping + aggregation (M3):
+  Config:
+    createTable({ ...,
+                  groupBy: "region" | ["region","status"] | null,
+                  initialCollapsedGroups: [["Europe"], ["Asia","Books"]],
+                  showGrandTotal: true })
+  Column opt-in for aggregates:
+    { key, aggregate: "sum"|"avg"|"min"|"max"|"count" | (rows,col)=>any,
+            aggregateFormat?: (value, col, count) => string }
+
+  Aggregates fold over LEAF rows at every depth. Safe default for reducers
+  that don't compose associatively (median, last-value-wins, distinct).
+  Nullish values are skipped for sum/avg/min/max; count is unconditional.
+  aggregateFormat is display-only; entry.aggregates.get(key) stays raw for
+  export. Errors in aggregateFormat are caught + logged.
+
+  Pipeline: rowsGetter -> filteredRows -> groupedRows -> visibleEntries
+  Sort applies WITHIN each leaf group. Groups themselves are sorted by
+  group key ascending; nulls bucket last. Filter runs BEFORE grouping so
+  empty groups vanish.
+
+  Reactive surface:
+    groupBy()           -> readonly string[]              -- [] = ungrouped
+    collapsedGroups()   -> ReadonlySet<string>            -- path-strings
+    groupedRows()       -> GroupNode[] | null             -- null when ungrouped
+    visibleEntries()    -> Entry[]                        -- interleaved rendering feed
+    entryCount()        -> number                         -- drives virtual axis
+    visibleRows()       -> Row[]                          -- DATA-ONLY, unchanged 1.1 contract
+    rowCount()          -> number                         -- DATA-ONLY, unchanged
+
+  Entry union:
+    { type: "data",         row }
+    { type: "group-header", depth, key, value, path, pathStr, count,
+                             aggregates, isCollapsed }
+    { type: "grand-total",  aggregates, count }
+
+  GroupNode:
+    { depth, key, value, path, pathStr, count,
+      aggregates: Map<colKey, any>,
+      subGroups: GroupNode[] | null,     -- internal nodes only
+      rows: Row[] | null                  -- leaf nodes only
+    }
+
+  Methods:
+    setGroupBy(v)                   idempotent; unknown keys dropped
+    toggleGroup(path)
+    expandGroup(path)               no-op if already expanded
+    collapseGroup(path)             no-op if already collapsed
+    expandAllGroups()               clears collapsed set
+    collapseAllGroups()             walks groupedRows() once
+    isGroupCollapsed(path)          O(1) predicate
+    groupAncestryAt(entryIndex)     GroupHeaderEntry[]; for sticky headers.
+                                    Returns strictly-shallower ancestors --
+                                    a depth-0 group-header at entryIndex
+                                    yields [], so sticky doesn't duplicate
+                                    the inline row.
+
+  Ungrouped fast path: when groupBy() is empty, groupedRows short-circuits
+  to null and visibleRows returns sort-applied rows directly. One extra
+  signal read of overhead vs 1.1.0.
+
+  DOM (when mounted):
+    Pool-rendered group header:
+      <div class="lt-row lt-row-group-header"
+           data-depth data-collapsed>
+        <div class="lt-cell" data-key>chevron + value + (N)</div>
+        <div class="lt-cell" data-key>aggregate or empty</div>
+        ...
+      </div>
+    Grand total (pool-rendered): same shape, class="lt-row lt-row-grand-total",
+    first cell reads "Total (N)".
+
+    Sticky group headers (always mounted; hidden when ungrouped):
+      viewport > .lt-sticky-groups   -- position:sticky; top:rowHeight;
+                                        height:0; z-index:2
+        > .lt-row-group-header.lt-sticky-group[data-depth][data-collapsed]
+          absolute; top:depth*rowHeight; grid layout inline
+      Note: sticky rows do NOT carry .lt-row so querySelectorAll(".lt-row")
+      still counts only pool slots.
+
+    Sticky grand total (always mounted; hidden when showGrandTotal is off):
+      viewport > .lt-sticky-grand-total   -- position:sticky; bottom:0;
+                                             height:0; z-index:2
+        > .lt-row-grand-total.lt-sticky-grand-total-row
+          absolute; top:-rowHeight to anchor bottom edge to container top
+
+    DOM order in viewport:
+      .lt-header (sticky top:0)
+      .lt-sticky-groups (sticky top:rowHeight, before inner)
+      .lt-inner (pool slots absolute translateY inside)
+      .lt-sticky-grand-total (sticky bottom:0, after inner)
+
+    Sticky ancestor source: axis.firstIndex() (from @zakkster/lite-virtual,
+    the pre-overscan first-visible entry). Using axis.start() would show
+    stale ancestors when scrolling across group boundaries because start
+    includes overscan slots ABOVE the viewport.
+
+    Click on sticky group row: same behavior as inline -- toggleGroup(path).
+    Click on grand-total row: ignored (no selection change).
+
+  Reactive column state carries over:
+    Sticky cells register the same colPlacement + pin effects that pool
+    cells do. Hiding the first-visible column moves the chevron+label to
+    the next; reordering keeps sticky + pool aligned; pin applies to sticky.
+
+  Zero-GC: 10k boundary scrolls, 100k rows, groupBy:"status",
+    showGrandTotal, sticky overlays active. signal-node delta 0,
+    link delta 2 (noise), pool delta 0. See bench/03-heap-grouped.js.
+
 TableCore lifecycle:
   dispose()                             releases all reactive nodes
   cellId(rowId, columnKey)              -> "lt_<rowId>__<columnKey>"
@@ -271,7 +391,9 @@ Filters (M2; mounted only when any column has filterable: true):
            </div> ...
          </div>
 Body:    <div class="lt-viewport"><div class="lt-inner">
-           <div class="lt-row [lt-row-alt] [is-selected]"
+           <div class="lt-row [lt-row-alt] [is-selected]
+                       [lt-row-group-header] [lt-row-grand-total]
+                       [data-depth data-collapsed]"        <!-- M3 header/total attrs -->
                 role="row"
                 aria-rowindex aria-selected
                 style="transform: translateY(<i*rowHeight>px)">
@@ -286,6 +408,34 @@ Body:    <div class="lt-viewport"><div class="lt-inner">
              ...
            </div> ...
          </div></div>
+
+Sticky overlays (M3; direct children of .lt-viewport):
+         <div class="lt-sticky-groups" aria-hidden="true"
+              style="position:sticky; top:<rowHeight>px;
+                     height:0; z-index:2">
+           <div class="lt-row-group-header lt-sticky-group"
+                data-depth data-collapsed
+                style="position:absolute; top:<depth*rowHeight>px;
+                       height:<rowHeight>px;
+                       display:grid; grid-template-columns:var(--lt-cols)">
+             <div class="lt-cell" data-key>chevron + value + (N)</div>
+             ...
+           </div> ...
+         </div>
+         <div class="lt-sticky-grand-total" aria-hidden="true"
+              style="position:sticky; bottom:0; height:0; z-index:2">
+           <div class="lt-row-grand-total lt-sticky-grand-total-row"
+                style="position:absolute; top:-<rowHeight>px;
+                       height:<rowHeight>px;
+                       display:grid; grid-template-columns:var(--lt-cols)">
+             <div class="lt-cell" data-key>Total (N) / aggregate</div>
+             ...
+           </div>
+         </div>
+
+Sticky rows deliberately do NOT carry the base .lt-row class so consumers'
+querySelectorAll(".lt-row") still counts only pool slots (backwards-compatible
+with 1.0/1.1 code that inspects the DOM this way).
 
 ## Keyboard
 
@@ -312,6 +462,9 @@ Click header               toggleSort
 (on a filter input):
   Escape                   setColumnFilter(key, "")
 Shift+click header         toggleSort additive
+Click group-header row     toggleGroup(entry.path) (M3, inline OR sticky)
+Click grand-total row      ignored (M3)
+Arrow-up/down              stays inside data rows -- skips headers (M3)
 
 ## Performance
 
@@ -341,13 +494,23 @@ Classes for styling:
   .lt-header-cell.is-drop-before / .is-drop-after
   .lt-header-resize:hover / .is-active
 
+M3 grouping / total classes:
+  .lt-row-group-header               pool-rendered group header
+  .lt-row-group-header[data-depth]   0 / 1 / 2 / 3 / 4 -> indent
+  .lt-row-group-header[data-collapsed="true"|"false"]
+  .lt-row-grand-total                pool-rendered grand total
+  .lt-sticky-groups                  sticky-header container (viewport child)
+  .lt-sticky-group                   sticky group-header row inside container
+  .lt-sticky-grand-total             sticky grand-total container
+  .lt-sticky-grand-total-row         sticky grand-total row inside container
+
 ## Files
 
-Table.js          single-file ESM source
+Table.js          single-file ESM source (~3100 lines)
 Table.d.ts        type declarations
-demo/index.html   QA demo with controls for all M1 features
+demo/index.html   QA demo with controls for all M1 / M2 / M3 features
 demo/serve.js     zero-dep static server (npm run demo)
-test/*.test.js    node:test suite (npm test, 110 tests across 9 files)
+test/*.test.js    node:test suite (npm test, 257 tests across 14 files)
 bench/*.js        benchmarks vs clusterize.js + naive virtual (npm run bench)
 llms.txt          this file
 README.md         human docs with Mermaid diagrams + bench numbers
@@ -367,6 +530,9 @@ Headline:
   - 10K boundary scrolls: signal nodes delta 0, signal links delta 0,
                           DOM pool delta 0, process heap noise floor
   - mount 1M rows:       ~56ms, 24-element pool, constant vs dataset size
+  - 10K boundary scrolls in a GROUPED 100k-row table with sticky group
+    headers + sticky grand total active: signal nodes delta 0, link
+    delta 2 (noise), pool delta 0. See bench/03-heap-grouped.js.
 
 The reactive graph and DOM pool are stable across all steady-state ops.
 Allocations happen only during mount and on demand (column reorder may
