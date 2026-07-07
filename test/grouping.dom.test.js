@@ -9,7 +9,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Window } from "happy-dom";
+import { createRegistry, setDefaultRegistry } from "@zakkster/lite-signal";
 import { createTable, mountTable } from "../Table.js";
+
+// Use a growable registry across all DOM tests. Default lite-signal config
+// caps at 1024 nodes; a test file that creates and disposes many tables
+// (even with proper disposal) can peak above that for legitimate reasons.
+// The production guidance is the opposite: pick a tight cap so leaks surface
+// as CapacityError. Tests grow.
+setDefaultRegistry(createRegistry({
+    onCapacityExceeded: "grow",
+    initialNodes: 2048
+}));
 
 // happy-dom: install a globalish DOM before importing the module. We do it
 // per-test to avoid cross-test contamination -- disposal cleans DOM but
@@ -23,6 +34,12 @@ function withDom(fn) {
         globalThis.HTMLElement = window.HTMLElement;
         globalThis.PointerEvent = window.PointerEvent;
         globalThis.queueMicrotask = window.queueMicrotask.bind(window);
+        globalThis.requestAnimationFrame = window.requestAnimationFrame
+            ? window.requestAnimationFrame.bind(window)
+            : (cb) => setTimeout(cb, 16);
+        globalThis.cancelAnimationFrame = window.cancelAnimationFrame
+            ? window.cancelAnimationFrame.bind(window)
+            : (id) => clearTimeout(id);
         try {
             await fn(window);
         } finally {
@@ -408,10 +425,16 @@ test("dom: sticky group-headers container exists inside viewport, not inner", wi
 
     const viewport = host.querySelector(".lt-viewport");
     const inner = host.querySelector(".lt-inner");
-    const stickyGroups = viewport.querySelector(":scope > .lt-sticky-groups");
-    const stickyGT = viewport.querySelector(":scope > .lt-sticky-grand-total");
-    assert(stickyGroups, "sticky-groups must be a direct child of .lt-viewport");
-    assert(stickyGT, "sticky-grand-total must be a direct child of .lt-viewport");
+    // happy-dom doesn't reliably support `:scope >`. Find the elements and
+    // verify parentage manually instead.
+    const stickyGroups = host.querySelector(".lt-sticky-groups");
+    const stickyGT = host.querySelector(".lt-sticky-grand-total");
+    assert(stickyGroups, "sticky-groups must exist");
+    assert(stickyGT, "sticky-grand-total must exist");
+    assert.equal(stickyGroups.parentElement, viewport,
+        "sticky-groups must be a direct child of .lt-viewport");
+    assert.equal(stickyGT.parentElement, viewport,
+        "sticky-grand-total must be a direct child of .lt-viewport");
 
     // DOM order: sticky-groups BEFORE inner, sticky-grand-total AFTER inner.
     const children = Array.from(viewport.children);
